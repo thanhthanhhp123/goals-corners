@@ -262,6 +262,17 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 20px 0; }
 .form-grid h5 { margin: 0 0 6px; font-size: 13px; display: flex; gap: 8px; align-items: center; }
 .form-grid h5 img { width: 18px; height: 18px; }
+.small { font-size: 12.5px; }
+.odds-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-2); margin-left: 6px; vertical-align: 2px; }
+.legend-line { margin: 0 0 4px; }
+.edge-pos { color: var(--ink); font-weight: 600; }
+.checker { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.checker select, .checker input {
+  border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 5px 8px; min-width: 0;
+}
+.checker input { width: 110px; }
+.checker-out { display: grid; gap: 4px; font-size: 13px; }
+.checker-verdict { font-size: 12.5px; }
 .note { font-size: 12.5px; color: var(--ink-2); padding: 12px 20px 0; display: flex; gap: 8px; align-items: flex-start; }
 .note svg { width: 16px; height: 16px; flex: none; fill: none; stroke: var(--warning); stroke-width: 2; margin-top: 1px; }
 

@@ -15,12 +15,14 @@ import pandas as pd
 
 from . import config, dist
 from .espn import played_mask
-from .model import RateModel, _count_pmf, team_groups
+from .model import RateModel, _count_pmf, team_groups, with_market
 
 log = logging.getLogger(__name__)
 
 KMAX = {"goals": 20, "corners": config.MAX_CORNERS}
 COLS = {"goals": ("home_goals", "away_goals"), "corners": ("home_corners", "away_corners")}
+MARKET_COLS = {"goals": ("mk_home", "mk_away")}
+MARKET_RECORD = ["mkp_home", "mkp_away", "mkp_p_over", "odds_over", "odds_under", "best_over", "best_under", "mk_margin_ou"]
 EVAL_LINES = {"goals": [1.5, 2.5, 3.5], "corners": [8.5, 9.5, 10.5, 11.5]}
 
 
@@ -50,8 +52,15 @@ def rolling(
     kinds: tuple[str, ...] = ("goals", "corners"),
     params: dict[str, dict] | None = None,
     comps: list[str] | None = None,
+    blend: float | None = None,
+    corner_market: dict | None = None,
 ) -> pd.DataFrame:
-    """Out-of-sample predictions for target-competition matches in [start, end)."""
+    """Out-of-sample predictions for target-competition matches in [start, end).
+
+    Matches with pre-closing odds (collected a day or more before kick-off) are
+    blended with them exactly as live fixtures are; `goals_model_*` columns keep
+    the model-only numbers.
+    """
     params = params or {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS}
     comps = comps or list(config.TARGET_COMPETITIONS)
     played = matches[played_mask(matches)]
@@ -81,7 +90,8 @@ def rolling(
         fitted = {}
         for kind in kinds:
             yh, ya = COLS[kind]
-            m = RateModel.from_params(params[kind]).fit(played, yh, ya, t0, groups, warm=warm[kind])
+            m = RateModel.from_params(params[kind]).fit(played, yh, ya, t0, groups, warm=warm[kind],
+                                                        market=MARKET_COLS.get(kind))
             if kind == "goals":
                 m.fit_rho()
             fitted[kind] = warm[kind] = m
@@ -90,14 +100,31 @@ def rolling(
                 "event_id": row.event_id, "date": row.date, "comp": row.comp,
                 "home_id": row.home_id, "away_id": row.away_id, "neutral": row.neutral,
             }
+            raw = {k: fitted[k].rates(row.home_id, row.away_id, row.comp, bool(row.neutral)) for k in kinds}
+            mk = (getattr(row, "mkp_home", np.nan), getattr(row, "mkp_away", np.nan))
+            mk = mk if np.all(np.isfinite(mk)) else None
+            g0 = raw.get("goals", (1.0, 1.0))
+            c0 = raw.get("corners", (1.0, 1.0))
+            if "goals" not in raw:
+                mk = None  # the corner adjustment is relative to the goals model
+            g1, c1 = with_market(*g0, *c0, mk, blend=blend, corner=corner_market)
+            adjusted = {**raw, **{k: v for k, v in (("goals", g1), ("corners", c1)) if k in raw}}
+            if mk is not None:
+                rec.update({f"mkt_{c}": getattr(row, c) for c in MARKET_RECORD})
             for kind in kinds:
                 yh, ya = COLS[kind]
                 ah, aa = getattr(row, yh), getattr(row, ya)
                 if pd.isna(ah) or pd.isna(aa):
                     continue
                 model = fitted[kind]
-                lh, la = model.rates(row.home_id, row.away_id, row.comp, bool(row.neutral))
+                lh, la = adjusted[kind]
                 pmf = _total_pmf(kind, model, lh, la)
+                if kind == "goals":
+                    pmf0 = _total_pmf(kind, model, *raw[kind])
+                    rec["goals_model_home"], rec["goals_model_away"] = raw[kind]
+                    rec["goals_model_pred"] = sum(raw[kind])
+                    for line in EVAL_LINES[kind]:
+                        rec[f"goals_model_p_over_{line}"] = dist.p_over(pmf0, line)
                 base, base_mean = baseline(kind, row.comp)
                 actual = int(ah + aa)
                 kk = min(actual, KMAX[kind])
@@ -160,11 +187,14 @@ def calibration(p: np.ndarray, o: np.ndarray, bins: int = 10) -> list[dict]:
 def tune(matches: pd.DataFrame, kind: str, start: str = "2025-08-01", end: str = "2026-06-15",
          step_days: int = 14, grid: dict | None = None) -> pd.DataFrame:
     """Grid search over hyperparameters on a validation window, scored by mean log score."""
-    grid = grid or {
+    grid = grid or ({
+        "market_weight": [3.0, 10.0, 30.0],
+        "half_life_days": [60.0, 90.0, 180.0],
+        "lam_team": [5.0, 10.0, 25.0],
+    } if kind == "goals" else {
         "half_life_days": [180.0, 270.0, 365.0, 540.0],
-        "lam_team": [2.0, 5.0, 10.0, 20.0],
-        "lam_comp": [5.0, 50.0],
-    }
+        "lam_team": [20.0, 40.0, 80.0, 160.0],
+    })
     base = dict(config.GOALS_PARAMS if kind == "goals" else config.CORNERS_PARAMS)
     keys = list(grid)
     rows = []

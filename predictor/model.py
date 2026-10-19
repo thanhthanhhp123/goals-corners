@@ -60,6 +60,9 @@ class RateModel:
     lam_group: float = 2.0
     lam_comp: float = 20.0
     lam_home: float = 20.0
+    # Goals only: weight of a match whose target is the market's expected goals
+    # instead of the scoreline (0 = ignore the market).
+    market_weight: float = 0.0
 
     # fitted state
     mu: float = 0.0
@@ -90,13 +93,27 @@ class RateModel:
         groups: dict[str, str],
         warm: "RateModel | None" = None,
         min_weight: float = 1e-3,
+        market: tuple[str, str] | None = None,
     ) -> "RateModel":
+        """Fit by penalised weighted Poisson likelihood.
+
+        With `market` (two columns of market-implied expected counts) and a
+        positive `market_weight`, matches that have market numbers are fitted
+        to them instead of to the observed counts.
+        """
         df = played[(played["date"] < as_of) & played[y_home].notna() & played[y_away].notna()]
         w = time_weights(df["date"], as_of, self.half_life_days)
         keep = w >= min_weight
         df, w = df[keep], w[keep]
         if df.empty:
             raise ValueError("no training data before %s" % as_of)
+        obs_h, obs_a = df[y_home].to_numpy(float), df[y_away].to_numpy(float)
+        tgt_h, tgt_a, w_fit = obs_h, obs_a, w
+        if market and self.market_weight > 0 and market[0] in df:
+            mh, ma = df[market[0]].to_numpy(float), df[market[1]].to_numpy(float)
+            has = np.isfinite(mh) & np.isfinite(ma)
+            tgt_h, tgt_a = np.where(has, mh, obs_h), np.where(has, ma, obs_a)
+            w_fit = w * np.where(has, self.market_weight, 1.0)
 
         teams = pd.Index(pd.unique(pd.concat([df["home_id"], df["away_id"]])))
         comps = pd.Index(sorted(df["comp"].unique()))
@@ -127,8 +144,8 @@ class RateModel:
             shape=(2 * n, P),
         )
         XT = X.T.tocsr()
-        y = np.concatenate([df[y_home].to_numpy(float), df[y_away].to_numpy(float)])
-        ww = np.concatenate([w, w])
+        y = np.concatenate([tgt_h, tgt_a])
+        ww = np.concatenate([w_fit, w_fit])
 
         lt, lg, lc, lh = self.lam_team, self.lam_group, self.lam_comp, self.lam_home
 
@@ -177,12 +194,13 @@ class RateModel:
         self.g_att = dict(zip(group_index, theta[o_gatt:o_gdfn].tolist()))
         self.g_dfn = dict(zip(group_index, theta[o_gdfn:].tolist()))
         self.groups = dict(groups)
-        n_eff = np.bincount(np.concatenate([hi, ai]), np.concatenate([w, w]), minlength=T)
+        w_conf = time_weights(df["date"], as_of, config.CONFIDENCE_HALF_LIFE)
+        n_eff = np.bincount(np.concatenate([hi, ai]), np.concatenate([w_conf, w_conf]), minlength=T)
         self.n_eff = dict(zip(teams, n_eff.tolist()))
 
         rates = np.exp(np.clip(X @ theta, -15, 15))
         rh, ra_ = rates[:n], rates[n:]
-        yh, ya = y[:n], y[n:]
+        yh, ya = obs_h, obs_a
         self.side_dispersion = _fit_nb_size(np.concatenate([yh, ya]), np.concatenate([rh, ra_]), np.concatenate([w, w]))
         self.dispersion = _fit_nb_size(yh + ya, rh + ra_, w)
         self._train = (yh, ya, rh, ra_, w)
@@ -264,9 +282,12 @@ class MatchPredictor:
     goals: RateModel
     corners: RateModel
 
-    def predict(self, home: str, away: str, comp: str, neutral: bool = False) -> dict:
+    def predict(self, home: str, away: str, comp: str, neutral: bool = False,
+                market: tuple[float, float] | None = None) -> dict:
+        """Full prediction; `market` is the match's market-implied expected goals, if known."""
         lh, la = self.goals.rates(home, away, comp, neutral)
         ch, ca = self.corners.rates(home, away, comp, neutral)
+        (lh, la), (ch, ca) = with_market(lh, la, ch, ca, market)
         m = dist.score_matrix(lh, la, self.goals.rho, config.MAX_GOALS)
         goals_total = dist.total_from_matrix(m)
         corners_total = _count_pmf(ch + ca, self.corners.dispersion, config.MAX_CORNERS)
@@ -303,6 +324,23 @@ class MatchPredictor:
         }
 
 
+def with_market(lh: float, la: float, ch: float, ca: float, market: tuple[float, float] | None,
+                blend: float | None = None, corner: dict | None = None) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Blend model expected goals with the market's and nudge expected corners to match.
+
+    web/model.js mirrors this function.
+    """
+    if market is None or not all(np.isfinite(market)) or min(market) <= 0:
+        return (lh, la), (ch, ca)
+    w = config.MARKET_BLEND if blend is None else blend
+    k = config.CORNER_MARKET if corner is None else corner
+    mh, ma = market
+    d_h, d_a = np.log(mh / lh), np.log(ma / la)
+    goals = (float(lh * np.exp(w * d_h)), float(la * np.exp(w * d_a)))
+    corners = (float(ch * np.exp(k["own"] * d_h + k["opp"] * d_a)), float(ca * np.exp(k["own"] * d_a + k["opp"] * d_h)))
+    return goals, corners
+
+
 def _count_pmf(mean: float, size: float, kmax: int) -> np.ndarray:
     if not np.isfinite(size) or size > 1e5:
         pmf = dist.poisson_pmf(mean, kmax)
@@ -330,7 +368,8 @@ def fit_predictor(matches: pd.DataFrame, as_of: pd.Timestamp, goals_params: dict
     played = matches[played_mask(matches)]
     groups = team_groups(matches, as_of)
     goals = RateModel.from_params(goals_params or config.GOALS_PARAMS)
-    goals.fit(played, "home_goals", "away_goals", as_of, groups, warm=warm.goals if warm else None).fit_rho()
+    goals.fit(played, "home_goals", "away_goals", as_of, groups, warm=warm.goals if warm else None,
+              market=("mk_home", "mk_away")).fit_rho()
     corners = RateModel.from_params(corners_params or config.CORNERS_PARAMS)
     corners.fit(played, "home_corners", "away_corners", as_of, groups, warm=warm.corners if warm else None)
     return MatchPredictor(goals, corners)

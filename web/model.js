@@ -104,10 +104,23 @@ export function rates(model, teams, kind, home, away, comp, neutral) {
   return [Math.exp(base + homeAdv + ah - da), Math.exp(base + aa - dh)];
 }
 
+/** Blend with the market's expected goals [home, away] (mirrors with_market in model.py). */
+export function withMarket(model, lh, la, ch, ca, market) {
+  if (!market || !market.every((x) => Number.isFinite(x) && x > 0)) return [lh, la, ch, ca];
+  const w = model.market_blend ?? 0;
+  const k = model.corner_market ?? { own: 0, opp: 0 };
+  const dh = Math.log(market[0] / lh), da = Math.log(market[1] / la);
+  return [
+    lh * Math.exp(w * dh), la * Math.exp(w * da),
+    ch * Math.exp(k.own * dh + k.opp * da), ca * Math.exp(k.own * da + k.opp * dh),
+  ];
+}
+
 /** Full prediction in the same shape as fixtures.json entries. */
-export function predictMatch(model, teams, home, away, comp, neutral = false) {
-  const [lh, la] = rates(model, teams, 'goals', home, away, comp, neutral);
-  const [ch, ca] = rates(model, teams, 'corners', home, away, comp, neutral);
+export function predictMatch(model, teams, home, away, comp, neutral = false, market = null) {
+  const [lh0, la0] = rates(model, teams, 'goals', home, away, comp, neutral);
+  const [ch0, ca0] = rates(model, teams, 'corners', home, away, comp, neutral);
+  const [lh, la, ch, ca] = withMarket(model, lh0, la0, ch0, ca0, market);
   const m = scoreMatrix(lh, la, model.goals.rho, model.max_goals);
   const goalsTotal = totalFromMatrix(m);
   const cornersTotal = countPmf(ch + ca, model.corners.dispersion, model.max_corners);

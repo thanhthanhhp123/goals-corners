@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import backtest, config, espn
+from . import backtest, config, espn, market
 from .model import MatchPredictor, fit_predictor
 
 log = logging.getLogger(__name__)
@@ -31,7 +31,8 @@ def _r(x, nd=3):
 
 
 def _params_key() -> str:
-    blob = json.dumps({"g": config.GOALS_PARAMS, "c": config.CORNERS_PARAMS, "v": 2}, sort_keys=True)
+    blob = json.dumps({"g": config.GOALS_PARAMS, "c": config.CORNERS_PARAMS, "b": config.MARKET_BLEND,
+                       "cm": config.CORNER_MARKET, "rho": config.MARKET_RHO, "v": 3}, sort_keys=True)
     return hashlib.md5(blob.encode()).hexdigest()[:10]
 
 
@@ -69,7 +70,8 @@ def season_metrics(preds: pd.DataFrame) -> list[dict]:
         sel = preds[(preds["date"] >= pd.Timestamp(season["start"], tz="UTC")) & (preds["date"] < pd.Timestamp(season["end"], tz="UTC"))]
         if sel.empty:
             continue
-        entry = {**season, "goals": _round_tree(backtest.summarise(sel, "goals")), "corners": _round_tree(backtest.summarise(sel, "corners")), "by_comp": {}}
+        entry = {**season, "goals": _round_tree(backtest.summarise(sel, "goals")), "corners": _round_tree(backtest.summarise(sel, "corners")),
+                 "market": _round_tree(market_metrics(sel)), "by_comp": {}}
         for comp in config.TARGET_COMPETITIONS:
             sc = sel[sel["comp"] == comp]
             if len(sc) >= 10:
@@ -78,6 +80,49 @@ def season_metrics(preds: pd.DataFrame) -> list[dict]:
                     "corners": _round_tree(_light(backtest.summarise(sc, "corners"))),
                 }
         out.append(entry)
+    return out
+
+
+VALUE_EDGE = 0.03  # expected return a bet needs before the backtest "places" it
+
+
+def _binary_scores(p: np.ndarray, y: np.ndarray) -> dict:
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return {"log_loss": float(-np.mean(np.where(y, np.log(p), np.log(1 - p)))),
+            "brier": float(np.mean((p - y) ** 2)), "hit_rate": float(np.mean((p > 0.5) == y))}
+
+
+def value_bets(p: np.ndarray, y: np.ndarray, over: np.ndarray, under: np.ndarray, edge: float) -> dict:
+    """Flat one-unit bets on whichever side of O/U 2.5 has expected return above `edge`."""
+    ev_o, ev_u = p * over - 1, (1 - p) * under - 1
+    take_o = (ev_o >= ev_u) & (ev_o > edge)
+    take_u = (ev_u > ev_o) & (ev_u > edge)
+    ret = np.concatenate([np.where(y[take_o], over[take_o] - 1, -1.0), np.where(~y[take_u], under[take_u] - 1, -1.0)])
+    if len(ret) == 0:
+        return {"bets": 0}
+    return {"bets": int(len(ret)), "won": float(np.mean(ret > 0)), "roi": float(ret.mean()),
+            "roi_se": float(ret.std(ddof=1) / np.sqrt(len(ret))) if len(ret) > 1 else None}
+
+
+def market_metrics(sel: pd.DataFrame) -> dict | None:
+    """Over/under 2.5 goals: model, model+odds and the bookmakers, on matches that had odds."""
+    if "mkt_mkp_p_over" not in sel:
+        return None
+    df = sel.dropna(subset=["mkt_mkp_p_over", "goals_actual", "goals_model_p_over_2.5"])
+    if len(df) < 30:
+        return None
+    y = df["goals_actual"].to_numpy() > 2.5
+    p_final = df["goals_p_over_2.5"].to_numpy()
+    out = {
+        "n": int(len(df)),
+        "margin": float(df["mkt_mk_margin_ou"].mean()),
+        "model": _binary_scores(df["goals_model_p_over_2.5"].to_numpy(), y),
+        "final": _binary_scores(p_final, y),
+        "market": _binary_scores(df["mkt_mkp_p_over"].to_numpy(), y),
+        "edge": VALUE_EDGE,
+        "avg_price": value_bets(p_final, y, df["mkt_odds_over"].to_numpy(), df["mkt_odds_under"].to_numpy(), VALUE_EDGE),
+        "best_price": value_bets(p_final, y, df["mkt_best_over"].to_numpy(), df["mkt_best_under"].to_numpy(), VALUE_EDGE),
+    }
     return out
 
 
@@ -153,6 +198,25 @@ def _prediction_json(pred: dict) -> dict:
     }
 
 
+def _market_json(predictor: MatchPredictor, row, mk) -> dict | None:
+    """Bookmaker view of a fixture next to the model's own (pre-blend) numbers."""
+    if mk is None:
+        return None
+    alone = predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral))
+    price = lambda x: None if pd.isna(x) else _r(x, 2)  # noqa: E731
+    return {
+        "xg": [_r(mk[0], 4), _r(mk[1], 4)],
+        "p_over": _r(row.mkp_p_over, 4),
+        "hda": [_r(row.mkp_p_home, 4), _r(row.mkp_p_draw, 4), _r(row.mkp_p_away, 4)],
+        "odds": {"over": price(row.odds_over), "under": price(row.odds_under),
+                 "best_over": price(row.best_over), "best_under": price(row.best_under),
+                 "home": price(row.odds_home), "draw": price(row.odds_draw), "away": price(row.odds_away)},
+        "margin": _r(row.mk_margin_ou, 4),
+        "model": {"total": _r(alone["goals"]["total"]), "p_over": _r(alone["goals"]["over"]["2.5"], 4),
+                  "corners": _r(alone["corners"]["total"])},
+    }
+
+
 def _confidence(predictor: MatchPredictor, home: str, away: str) -> str:
     n = min(predictor.corners.n_eff.get(home, 0.0), predictor.corners.n_eff.get(away, 0.0),
             predictor.goals.n_eff.get(home, 0.0), predictor.goals.n_eff.get(away, 0.0))
@@ -174,6 +238,9 @@ def build(force_fetch: bool = True) -> dict:
     now = pd.Timestamp(datetime.now(timezone.utc))
     log.info("fetching data")
     matches, teams = espn.load_dataset(force=force_fetch)
+    log.info("fetching odds")
+    odds = market.market_table(matches, teams, rho=config.MARKET_RHO, force=force_fetch)
+    matches = market.attach(matches, odds)
     names = dict(zip(teams["team_id"], teams["name"]))
     played = matches[espn.played_mask(matches)]
 
@@ -191,13 +258,15 @@ def build(force_fetch: bool = True) -> dict:
     for row in upcoming.itertuples(index=False):
         if not (_known_team(predictor, row.home_id, names) and _known_team(predictor, row.away_id, names)):
             continue
-        pred = predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral))
+        mk = (row.mkp_home, row.mkp_away)
+        mk = mk if np.all(np.isfinite(mk)) else None
+        pred = predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral), market=mk)
         fixtures.append({
             "id": row.event_id, "comp": row.comp, "date": row.date.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "state": row.state, "status": row.status, "neutral": bool(row.neutral), "venue": row.venue,
             "home": row.home_id, "away": row.away_id,
-            "market_goals_line": None if pd.isna(row.market_goals_line) else float(row.market_goals_line),
             "confidence": _confidence(predictor, row.home_id, row.away_id),
+            "market": _market_json(predictor, row, mk),
             **_prediction_json(pred),
         })
 
@@ -220,6 +289,9 @@ def build(force_fetch: bool = True) -> dict:
                 "actual": int(actual), "home_actual": int(r[f"{kind}_home_actual"]), "away_actual": int(r[f"{kind}_away_actual"]),
                 "p_over": {str(l): _r(r[f"{kind}_p_over_{l}"], 4) for l in backtest.EVAL_LINES[kind]},
             }
+        p_mkt = r.get("mkt_mkp_p_over")
+        if p_mkt is not None and not pd.isna(p_mkt) and "goals" in rec:
+            rec["goals"]["market_p_over"] = _r(p_mkt, 4)
         results.append(rec)
 
     log.info("exporting")
@@ -267,6 +339,7 @@ def build(force_fetch: bool = True) -> dict:
     model_json = {
         "goals": {k: _round_tree(v, 5) for k, v in predictor.goals.export().items()},
         "corners": {k: _round_tree(v, 5) for k, v in predictor.corners.export().items()},
+        "market_blend": config.MARKET_BLEND, "corner_market": config.CORNER_MARKET,
         "max_goals": config.MAX_GOALS, "max_corners": config.MAX_CORNERS,
         "goal_lines": config.GOAL_LINES, "corner_lines": config.CORNER_LINES, "team_corner_lines": config.TEAM_CORNER_LINES,
     }
@@ -276,7 +349,10 @@ def build(force_fetch: bool = True) -> dict:
         "matches_total": int(len(matches)), "matches_played": int(len(played)),
         "matches_with_corners": int(played["home_corners"].notna().sum()),
         "fixtures": len(fixtures), "competitions": competitions,
-        "params": {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS},
+        "matches_with_odds": int(played["mk_home"].notna().sum()),
+        "fixtures_with_odds": sum(1 for f in fixtures if f["market"]),
+        "params": {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS,
+                   "market_blend": config.MARKET_BLEND, "corner_market": config.CORNER_MARKET},
         "metrics": metrics,
     }
     config.WEB_DATA_DIR.mkdir(parents=True, exist_ok=True)

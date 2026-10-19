@@ -11,6 +11,10 @@ For each fixture you get:
 - 1X2, both-teams-to-score, clean sheets and the most likely scorelines
 - team corner lines and the chance each side wins more corners
 - recent form (goals and corners, last 6 matches) for both clubs
+- when bookmaker odds are out (league games, a few days before kick-off): the bookmakers'
+  probabilities next to ours, average and best prices, and the expected return at each price
+- a price checker: type any bookmaker's odds for a goals, corners or both-teams-to-score line
+  and see our probability and the expected return
 
 Other views:
 
@@ -18,8 +22,8 @@ Other views:
   kick-off, with running hit rates.
 - **Match tool** predicts any pairing of clubs, including clubs from different leagues.
 - **Teams** lists attack, defence and corner ratings for every club.
-- **Model** reports out-of-sample accuracy against a baseline, calibration charts and the
-  method.
+- **Model** reports out-of-sample accuracy against a baseline and against the bookmakers,
+  calibration charts and the method.
 
 ## Quick start
 
@@ -69,6 +73,16 @@ The extra leagues and cups link every Champions League club to one shared rating
 Raw responses are cached in `data/raw/`; past years are downloaded once.
 ESPN reports a missing box score as 0–0 corners, so those games are treated as missing.
 
+**Odds** (`predictor/market.py`). [football-data.co.uk](https://www.football-data.co.uk)
+publishes free CSVs for 16 of these leagues (not the UEFA cups) with average, best and
+single-bookmaker prices for 1X2 and over/under 2.5, in two snapshots: pre-closing (Tuesday
+and Friday before a round) and closing. Rows are matched to ESPN events by date, score and
+club names (about 20,000 matches, 99–100% coverage). From each match's 1X2 and over/under
+prices, with the margin removed, we solve for the two expected-goal numbers whose
+Dixon–Coles score grid reproduces them. The same files carry corner counts, which fill
+ESPN's gaps (3,000+ extra matches, mostly 2023–24).
+Files are cached in `data/market/`.
+
 **Model** (`predictor/model.py`). Two penalised Poisson regressions, one for goals and one
 for corners:
 
@@ -76,19 +90,28 @@ for corners:
 log E[count for a side] = mu + competition + home advantage + attack(team) − defence(opponent)
 ```
 
+- Goals: wherever a past match had odds, the regression is fitted to the expected goals
+  implied by its closing prices instead of the scoreline, and such a match counts 30 times
+  a scoreline. A price measures team strength with far less luck than a result does, so the
+  ratings can follow form with a 60-day half-life. UEFA cup games and leagues without odds
+  are fitted to their scores.
 - Matches are weighted by recency (exponential half-life).
 - Each club's ratings are shrunk toward its league's average, which keeps estimates stable
   for clubs with little data.
 - Goals: the two expected values give a scoreline grid with a Dixon–Coles low-score
   correction. The total-goals distribution, 1X2, BTTS and over/unders all come from that grid.
+- When a fixture has pre-closing odds, its expected goals are a geometric blend: 60% the
+  bookmakers', 40% the model's (`MARKET_BLEND`).
 - Corners: a negative-binomial distribution with a fitted dispersion, because corner totals
-  vary more than a Poisson count does.
+  vary more than a Poisson count does. Nudging corners by the odds and adding shot-volume
+  ratings were both tested; neither improved the held-out season reliably, so neither is used.
 - Hyperparameters live in `predictor/config.py` and were chosen by `tune` on the 2025-26
   season only.
 
 **Evaluation** (`predictor/backtest.py`). Rolling origin: each week the model is refitted
 using only matches played before that week, then scored on that week's games. The baseline
-is the competition's empirical distribution of totals over the previous year. 2026-27 is
+is the competition's empirical distribution of totals over the previous year. Blending uses
+only the pre-closing odds, which were public a day or more before kick-off. 2026-27 is
 held out from tuning. Results are cached in `data/backtest_*.pkl`, so later builds only
 compute new weeks.
 
@@ -114,21 +137,36 @@ tests/
 
 Every number below comes from a weekly backtest. 2026-27 was never used to choose settings.
 
-| | 2025-26 (tuning season) | 2026-27 (held out, to 18 Oct) |
+| | 2025-26 (tuning season) | 2026-27 (held out, to 19 Oct) |
 |---|---|---|
-| Matches | 1,937 | 373 |
-| Goals O/U 2.5 calls correct | 57.9% (baseline 55.6%) | 62.7% (baseline 58.2%) |
-| Avg error, total goals | 1.32 (baseline 1.33) | 1.46 (baseline 1.51) |
-| Corners O/U 9.5 calls correct | 56.5% (baseline 53.2%) | 57.1% (baseline 52.0%) |
+| Matches | 1,937 | 377 |
+| Goals O/U 2.5 calls correct | 58.7% (baseline 55.6%) | 63.9% (baseline 58.4%) |
+| Avg error, total goals | 1.31 (baseline 1.33) | 1.43 (baseline 1.51) |
+| Corners O/U 9.5 calls correct | 56.8% (baseline 53.2%) | 56.2% (baseline 51.7%) |
 | Avg error, total corners | 2.67 (baseline 2.70) | 2.81 (baseline 2.86) |
 
 The baseline is each competition's own distribution of totals over the previous 365 days.
-Match totals are noisy, so expect an edge of a few percentage points, not a large one.
-Scoring in 2026-27 is running well above earlier seasons (3.18 goals per game against 2.87
-predicted). The model's league levels are catching up week by week.
+
+**Against the bookmakers.** Over/under 2.5 goals in big-five league matches that had odds
+(log loss, lower is better):
+
+| | 2025-26 (1,751 matches) | 2026-27 (341 matches) |
+|---|---|---|
+| Earlier score-only model | 0.681 | 0.658 (297 matches to 18 Oct) |
+| Model alone | 0.6761 | 0.6491 |
+| Model + odds (what the site shows) | **0.6758** | **0.6455** |
+| Bookmakers, margin removed | 0.6760 | 0.6432 |
+
+On the tuning season the blend matches the bookmakers; on the held-out season it trails them
+by 0.002 (the score-only model trailed by 0.017). Matching the bookmakers is not the same as
+beating them: their margin averaged 6.8%, and backing every over/under 2.5 "edge" above 3% at
+the best price across bookmakers returned −5.5% over 113 bets in 2025-26 and −36% over 67 bets
+so far in 2026-27. The site shows edges, but treat them as hints. Corner odds are not in the
+free data, so the corner forecasts are only tested against results.
 
 ## Limits
 
-Predictions cover regulation time (90 minutes plus stoppage time). The model does not know
-about line-ups, injuries, suspensions, weather, referee tendencies or motivation, and corner
-totals are noisy by nature. Treat the numbers as an informed starting point, not a certainty.
+Predictions cover regulation time (90 minutes plus stoppage time). Line-ups, injuries,
+suspensions and motivation reach the forecast only through bookmaker odds, so only for league
+games whose odds are out. The Champions League has no odds in the free data. Corner totals are
+noisy by nature. Treat the numbers as an informed starting point, not a certainty.

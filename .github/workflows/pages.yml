@@ -32,11 +32,12 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # ESPN downloads and finished backtest weeks, so later runs take about a minute.
+      # ESPN and football-data downloads and finished backtest weeks, so later runs take a minute or two.
       - uses: actions/cache@v4
         with:
           path: |
             data/raw
+            data/market
             data/backtest_*.pkl
           key: espn-${{ github.run_id }}
           restore-keys: espn-

@@ -54,10 +54,13 @@ def main() -> None:
     elif args.cmd in ("backtest", "tune"):
         import pandas as pd
 
-        from . import backtest, espn
+        from . import backtest, config, espn, market
 
-        matches, _ = espn.load_dataset(force=False)
+        matches, teams = espn.load_dataset(force=False)
+        matches = market.attach(matches, market.market_table(matches, teams, rho=config.MARKET_RHO))
         if args.cmd == "backtest":
+            from .build import market_metrics
+
             end = args.end or pd.Timestamp.now(tz="UTC")
             preds = backtest.rolling(matches, args.start, end, step_days=args.step)
             for kind in ("goals", "corners"):
@@ -65,6 +68,7 @@ def main() -> None:
                 for line in s.get("lines", {}).values():
                     line.pop("calibration", None)
                 print(kind, json.dumps(s, indent=1, default=float))
+            print("vs bookmakers", json.dumps(market_metrics(preds), indent=1, default=float))
         else:
             res = backtest.tune(matches, args.kind, args.start, args.end)
             print(res.to_string(index=False))

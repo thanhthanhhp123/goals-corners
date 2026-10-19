@@ -188,10 +188,11 @@ function renderFilters() {
 }
 
 // ------------------------------------------------------------------ fixtures
-function metricCell(kind, total, unit, p, line) {
+function metricCell(kind, total, unit, p, line, withOdds = false) {
   return h('div', { class: `metric c-${kind}` },
     h('div', { class: 'top' },
-      h('span', { class: 'val' }, f1(total), h('small', {}, unit)),
+      h('span', { class: 'val' }, f1(total), h('small', {}, unit),
+        withOdds ? h('span', { class: 'odds-dot', title: 'Includes bookmaker odds', 'aria-label': 'includes bookmaker odds' }) : null),
       h('span', { class: 'p' }, `O${line} `, h('b', {}, pct(p)))),
     h('div', { class: `meter ${kind}`, role: 'img', 'aria-label': `${pct(p)} chance of over ${line} ${unit}` },
       h('i', { style: `width:${Math.round((p ?? 0) * 100)}%` })));
@@ -215,7 +216,7 @@ function fixtureRow(f, showDate) {
     teamCell(f.home, 'home'),
     h('div', { class: 'xg', title: 'Expected goals' }, h('b', {}, f1(f.goals.home)), ' – ', h('b', {}, f1(f.goals.away))),
     teamCell(f.away, 'away')),
-  metricCell('goals', f.goals.total, 'goals', f.goals.over[state.goalLine], state.goalLine),
+  metricCell('goals', f.goals.total, 'goals', f.goals.over[state.goalLine], state.goalLine, !!f.market),
   metricCell('corners', f.corners.total, 'corners', f.corners.over[state.cornerLine], state.cornerLine),
   confCell(f));
 }
@@ -246,6 +247,10 @@ function renderFixtures(view) {
     tile('Avg expected goals', f2(avg((f) => f.goals.total)), `${pct(avg((f) => f.goals.over[state.goalLine]))} avg chance of over ${state.goalLine}`),
     tile('Avg expected corners', f2(avg((f) => f.corners.total)), `${pct(avg((f) => f.corners.over[state.cornerLine]))} avg chance of over ${state.cornerLine}`)));
 
+  if (list.some((f) => f.market)) {
+    view.append(h('p', { class: 'small muted legend-line' }, h('span', { class: 'odds-dot' }),
+      ' Forecast blended with bookmaker odds. League odds appear a few days before kick-off; the Champions League has none.'));
+  }
   const head = listHead(['Time', 'xG', 'Total goals', 'Total corners']);
   if (state.sort !== 'date') {
     view.append(h('div', { class: 'card' }, head, list.slice(0, 400).map((f) => fixtureRow(f, true))));
@@ -395,8 +400,103 @@ function goalsExtras(f) {
   return h('div', {},
     facts,
     h('div', { class: 'section-title', style: 'margin-top:14px' }, 'Most likely scores'),
-    h('div', { class: 'scores' }, g.scores.slice(0, 6).map((s) => h('span', {}, h('b', {}, `${s.h}-${s.a}`), pct(s.p)))),
-    f.market_goals_line != null ? h('p', { class: 'muted', style: 'font-size:12.5px;margin:10px 0 0' }, `Bookmaker goals line (via ESPN): ${f.market_goals_line}. Model chance of over ${f.market_goals_line}: ${pct(g.over[String(f.market_goals_line)])}.`) : null);
+    h('div', { class: 'scores' }, g.scores.slice(0, 6).map((s) => h('span', {}, h('b', {}, `${s.h}-${s.a}`), pct(s.p)))));
+}
+
+// ------------------------------------------------------------------ prices
+const signedPct = (x) => (x == null ? '–' : `${x >= 0 ? '+' : '−'}${Math.abs(x * 100).toFixed(1)}%`);
+const VALUE_EDGE = 0.03;
+
+function edgeCell(prob, price) {
+  if (!price) return h('td', { class: 'muted' }, '–');
+  const ev = prob * price - 1;
+  return h('td', { class: ev > VALUE_EDGE ? 'edge-pos' : 'muted' }, signedPct(ev));
+}
+
+/** Backtest record of betting the edges this page shows, for the latest season that has one. */
+function valueRecord() {
+  const s = [...D.meta.metrics].reverse().find((x) => x.market?.best_price?.bets);
+  return s ? { season: s.label, ...s.market } : null;
+}
+
+function marketPanel(f) {
+  const m = f.market;
+  const g = f.goals;
+  const hn = team(f.home).short || team(f.home).name;
+  const an = team(f.away).short || team(f.away).name;
+  const p = g.over['2.5'];
+  const row = (label, ours, theirs, avg, best) => h('tr', {},
+    h('td', { class: 'left' }, label), h('td', {}, h('b', {}, pct(ours))), h('td', {}, pct(theirs)),
+    h('td', {}, avg ? f2(avg) : '–'), h('td', {}, best ? f2(best) : '–'), h('td', { class: 'muted' }, odds(ours)), edgeCell(ours, best));
+  const rec = valueRecord();
+  return h('div', { class: 'card panel' },
+    h('h4', {}, 'Against the bookmakers'),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' },
+      h('thead', {}, h('tr', {}, ['', 'Ours', 'Bookmakers', 'Avg odds', 'Best odds', 'Fair odds', 'Edge at best']
+        .map((t, i) => h('th', { class: i === 0 ? 'left' : '' }, t)))),
+      h('tbody', {},
+        row('Over 2.5', p, m.p_over, m.odds.over, m.odds.best_over),
+        row('Under 2.5', 1 - p, 1 - m.p_over, m.odds.under, m.odds.best_under),
+        row(`${hn} win`, g.hda[0], m.hda[0], m.odds.home, null),
+        row('Draw', g.hda[1], m.hda[1], m.odds.draw, null),
+        row(`${an} win`, g.hda[2], m.hda[2], m.odds.away, null)))),
+    h('p', { class: 'small muted' },
+      `"Bookmakers" is the average price with the margin (${pct(m.margin)} on this over/under) removed. `,
+      `On its own the model expected ${f2(m.model.total)} goals (${pct(m.model.p_over)} over 2.5); the bookmakers imply ${f2(m.xg[0] + m.xg[1])}. `,
+      `The forecast on this page takes ${Math.round(D.model.market_blend * 100)}% from the bookmakers, the mix that scored best on the 2025-26 tuning season.`),
+    rec ? h('p', { class: 'small muted' },
+      `Edges this size are mostly noise. In ${rec.season}, backing every over/under 2.5 edge above ${Math.round(rec.edge * 100)}% at the best price returned `,
+      h('b', {}, signedPct(rec.best_price.roi)), ` over ${rec.best_price.bets} bets (±${Math.round((rec.best_price.roi_se ?? 0) * 100)}% standard error).`) : null);
+}
+
+function priceChecker(f) {
+  const hn = team(f.home).short || team(f.home).name;
+  const an = team(f.away).short || team(f.away).name;
+  const over = (x, l) => x.over[l] ?? pOverFromPmf(x.pmf, l);
+  const markets = [
+    { label: 'Total goals', lines: D.model.goal_lines, def: state.goalLine, p: (l) => over(f.goals, l) },
+    { label: 'Total corners', lines: D.model.corner_lines, def: state.cornerLine, p: (l) => over(f.corners, l) },
+    { label: `${hn} corners`, lines: D.model.team_corner_lines, def: '4.5', p: (l) => f.corners.home_over[l] },
+    { label: `${an} corners`, lines: D.model.team_corner_lines, def: '4.5', p: (l) => f.corners.away_over[l] },
+    { label: 'Both teams score', lines: null, p: () => f.goals.btts },
+  ];
+  const mSel = h('select', { 'aria-label': 'Market' }, markets.map((m, i) => h('option', { value: i }, m.label)));
+  const lSel = h('select', { 'aria-label': 'Line' });
+  const sSel = h('select', { 'aria-label': 'Side' });
+  const price = h('input', { type: 'number', inputmode: 'decimal', min: '1.01', step: '0.01', placeholder: 'e.g. 1.90', 'aria-label': 'Decimal odds' });
+  const out = h('div', { class: 'checker-out', role: 'status' });
+  const fillLines = () => {
+    const m = markets[mSel.value];
+    lSel.hidden = !m.lines;
+    if (m.lines) lSel.replaceChildren(...m.lines.map((l) => h('option', { value: String(l), selected: String(l) === String(m.def) }, String(l))));
+    sSel.replaceChildren(...(m.lines ? ['Over', 'Under'] : ['Yes', 'No']).map((s) => h('option', { value: s }, s)));
+  };
+  const update = () => {
+    const m = markets[mSel.value];
+    const q0 = m.p(m.lines ? lSel.value : null);
+    const q = sSel.value === 'Over' || sSel.value === 'Yes' ? q0 : 1 - q0;
+    const o = Number(price.value);
+    if (!(o > 1)) {
+      out.replaceChildren(h('span', {}, 'Our chance ', h('b', {}, pct(q)), ` · fair odds ${odds(q)}. Enter a bookmaker's price to compare.`));
+      return;
+    }
+    const ev = q * o - 1;
+    const verdict = ev > 0.05 ? ['edge-pos', 'Above our fair price'] : ev > 0 ? ['', 'Slightly above our fair price, within the model\'s error'] : ['muted', 'Below our fair price'];
+    out.replaceChildren(
+      h('span', {}, 'Our chance ', h('b', {}, pct(q)), ` · the price implies ${pct(1 / o)} · expected return `, h('b', { class: verdict[0] }, signedPct(ev))),
+      h('span', { class: `checker-verdict ${verdict[0]}` }, verdict[1]));
+  };
+  mSel.addEventListener('change', () => { fillLines(); update(); });
+  for (const el of [lSel, sSel]) el.addEventListener('change', update);
+  price.addEventListener('input', update);
+  fillLines();
+  update();
+  return h('div', { class: 'card panel' },
+    h('h4', {}, 'Check a price'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Compare any bookmaker\'s decimal odds with our probability.'),
+    h('div', { class: 'checker' }, mSel, lSel, sSel, price),
+    out,
+    h('p', { class: 'small muted' }, 'Bookmakers often take a bigger margin on corner markets than on goals. Our corner forecasts have been tested against results only: corner odds are not in our data.'));
 }
 
 function fact(label, value) {
@@ -455,6 +555,7 @@ export function matchDetail(f, { closable }) {
     notes.push(h('div', { class: 'note' }, h('span', {},
       `Final: ${r.goals ? r.goals.actual : '–'} goals, ${r.corners ? r.corners.actual : '–'} corners. `,
       `Before kick-off the model expected ${r.goals ? f1(r.goals.pred) : '–'} goals and ${r.corners ? f1(r.corners.pred) : '–'} corners. `,
+      r.goals?.market_p_over != null ? `Over 2.5 goals: ${pct(r.goals.p_over['2.5'])} from us, ${pct(r.goals.market_p_over)} from the bookmakers. ` : '',
       'The distributions below use the current ratings.')));
   }
   if (f.confidence === 'low' || f.confidence === 'medium') {
@@ -470,6 +571,7 @@ export function matchDetail(f, { closable }) {
     h('div', { class: 'detail-grid' },
       h('div', {}, distPanel('goals', f, D.model.goal_lines, state.goalLine), h('div', { class: 'card panel', style: 'margin-top:16px' }, goalsExtras(f))),
       h('div', {}, distPanel('corners', f, D.model.corner_lines, state.cornerLine), h('div', { class: 'card panel', style: 'margin-top:16px' }, cornersExtras(f)))),
+    f.result ? null : h('div', { class: 'detail-grid' }, f.market ? marketPanel(f) : null, priceChecker(f)),
     h('div', { class: 'section-title', style: 'padding:0 20px' }, 'Recent form'),
     h('div', { class: 'form-grid', style: 'padding-top:0' }, formTable(f.home), formTable(f.away)));
 }
@@ -519,7 +621,7 @@ function renderTool(view) {
     const n = Math.min(team(home).n_eff ?? 0, team(away).n_eff ?? 0);
     const f = {
       id: 'tool', comp: compSel.value, date: scheduled?.date ?? new Date().toISOString(), home, away, neutral: neutralIn.checked,
-      venue: scheduled?.venue, market_goals_line: null, confidence: n >= 20 ? 'high' : n >= 8 ? 'medium' : 'low', ...pred,
+      venue: scheduled?.venue, confidence: n >= 20 ? 'high' : n >= 8 ? 'medium' : 'low', ...pred,
     };
     out.replaceChildren(h('div', { class: 'card' }, matchDetail(f, { closable: false })));
   };
@@ -618,6 +720,30 @@ function renderModel(view) {
       tile('Avg error, total corners', f2(c.mae), `baseline ${f2(c.base_mae)} · RPS skill ${skill(c)}`)));
   }
 
+  const mk = season.market;
+  if (mk) {
+    const row = (label, s, strong) => h('tr', {},
+      h('td', { class: 'left' }, strong ? h('b', {}, label) : label),
+      h('td', {}, s.log_loss.toFixed(4)), h('td', {}, s.brier.toFixed(4)), h('td', {}, pct(s.hit_rate)));
+    const bets = (b) => (b.bets ? `${b.bets} bets, ${signedPct(b.roi)} return (±${Math.round((b.roi_se ?? 0) * 100)}%)` : 'no bets');
+    view.append(h('div', { class: 'section-title' }, 'Against the bookmakers'),
+      h('div', { class: 'card panel' },
+        h('p', { class: 'small muted', style: 'margin-top:0' },
+          `Over/under 2.5 goals in the ${mk.n.toLocaleString()} big-five league matches of ${season.label} that had odds. Lower log loss and Brier score are better.`),
+        h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' },
+          h('thead', {}, h('tr', {}, ['Forecast', 'Log loss', 'Brier', 'O/U 2.5 correct'].map((t, i) => h('th', { class: i === 0 ? 'left' : '' }, t)))),
+          h('tbody', {},
+            row('Model alone', mk.model),
+            row('Model + odds (what this site shows)', mk.final, true),
+            row('Bookmakers, margin removed', mk.market)))),
+        h('p', { class: 'small' },
+          `Betting every over/under 2.5 edge above ${Math.round(mk.edge * 100)}%: at average prices ${bets(mk.avg_price)}; at the best price across bookmakers ${bets(mk.best_price)}. `,
+          `The bookmakers' margin on this market averaged ${pct(mk.margin)}.`),
+        h('p', { class: 'small muted' },
+          'Bookmaker prices already contain team news, line-ups and the money of professional bettors, so beating them over many bets is hard. ',
+          'Treat a single "edge" on this site as a hint, not a sure profit.')));
+  }
+
   const comps = Object.entries(season.by_comp);
   if (comps.length) {
     view.append(h('div', { class: 'section-title' }, `By competition, ${season.label}`),
@@ -651,12 +777,19 @@ function renderModel(view) {
   view.append(h('div', { class: 'section-title' }, 'How it works'), h('div', { class: 'prose' },
     h('p', {}, `The model is trained on ${m.matches_played.toLocaleString()} finished matches since January 2023 (${m.matches_with_corners.toLocaleString()} with corner counts). The six target competitions are covered, plus ${support.length} others: ${support.join(', ')}. Second divisions rate promoted clubs, and the other leagues and UEFA cups put every Champions League club on one shared scale.`),
     h('h3', {}, 'Goals'),
-    h('p', {}, 'Each club gets an attack and a defence rating. Expected goals for a side = exp(baseline + competition effect + home advantage + own attack − opponent defence). Ratings come from a Poisson regression where recent matches count more (half-life ', String(m.params.goals.half_life_days), ' days). Ratings are also pulled toward the club\'s league average, which keeps numbers sensible for clubs with few matches. The two expected-goal numbers give a full scoreline grid, with a Dixon–Coles correction for low scores, and the total-goals distribution comes from that grid.'),
+    h('p', {}, 'Each club gets an attack and a defence rating. Expected goals for a side = exp(baseline + competition effect + home advantage + own attack − opponent defence). ',
+      `Where a past match had bookmaker odds (${(m.matches_with_odds ?? 0).toLocaleString()} matches in 16 leagues), the ratings are fitted to the expected goals implied by its closing 1X2 and over/under prices rather than to the scoreline, because a price measures team strength with far less luck in it. `,
+      'Other matches, such as the UEFA cups, are fitted to their scores. Recent matches count more (half-life ', String(m.params.goals.half_life_days), ' days), and ratings are pulled toward the club\'s league average, which keeps numbers sensible for clubs with few matches. The two expected-goal numbers give a full scoreline grid, with a Dixon–Coles correction for low scores, and the total-goals distribution comes from that grid.'),
+    h('h3', {}, 'Bookmaker odds'),
+    h('p', {}, 'Odds come from football-data.co.uk, which publishes average and best prices across bookmakers for the main European leagues, collected on Tuesday and Friday before each round. The Champions League is not covered. ',
+      `When a fixture has odds, its expected goals are a blend of the model's and the bookmakers' (${Math.round((m.params.market_blend ?? 0) * 100)}% bookmakers), the mix that scored best on 2025-26`,
+      m.params.corner_market && (m.params.corner_market.own || m.params.corner_market.opp)
+        ? ', and a side the bookmakers rate above the model also gets slightly more expected corners.' : '.'),
     h('h3', {}, 'Corners'),
-    h('p', {}, 'The same structure is fitted separately on corners won: a corner-winning rating and a corner-conceding rating per club. Corner totals vary more than a Poisson count allows, so total corners use a negative-binomial distribution with its spread fitted from the data. ESPN records missing box scores as 0–0 corners; those games are treated as missing.'),
+    h('p', {}, 'The same structure is fitted separately on corners won: a corner-winning rating and a corner-conceding rating per club. Corner totals vary more than a Poisson count allows, so total corners use a negative-binomial distribution with its spread fitted from the data. ESPN records missing box scores as 0–0 corners; those games are treated as missing, and filled from football-data.co.uk where it has the count.'),
     h('h3', {}, 'Testing'),
-    h('p', {}, 'Settings were tuned on 2025-26 only. 2026-27 is held out: each week the model is refitted on matches played before that week and then scored on that week\'s games. The baseline is the competition\'s own distribution of totals over the previous year. RPS skill is the improvement in ranked probability score over that baseline; higher is better.'),
-    h('p', {}, 'Predictions cover regulation time only. Line-ups, injuries, weather and motivation are not in the model, so use these numbers as a starting point, not a guarantee.'),
+    h('p', {}, 'Settings were tuned on 2025-26 only. 2026-27 is held out: each week the model is refitted on matches played before that week and then scored on that week\'s games, using only the pre-closing odds that were public a day or more before kick-off. The baseline is the competition\'s own distribution of totals over the previous year. RPS skill is the improvement in ranked probability score over that baseline; higher is better.'),
+    h('p', {}, 'Predictions cover regulation time only. Line-ups, injuries and motivation reach the forecast only through bookmaker odds, when a fixture has them, so use these numbers as a starting point, not a guarantee.'),
     h('p', { class: 'muted' }, `Last build: ${new Date(m.generated_at).toLocaleString()} (${m.build_seconds}s). ${m.fixtures} upcoming fixtures predicted.`)));
 }
 

@@ -13,8 +13,12 @@ import { pathToFileURL } from 'node:url';
 const dir = process.argv[2];
 const { predictMatch } = await import(pathToFileURL(dir + '/model.js'));
 const load = (n) => JSON.parse(readFileSync(dir + '/data/' + n + '.json', 'utf8'));
-const model = load('model'), teams = load('teams'), fixtures = load('fixtures').slice(0, 60);
-const out = fixtures.map((f) => ({ id: f.id, pred: predictMatch(model, teams, f.home, f.away, f.comp, f.neutral) }));
+// odds-blended fixtures first, so both code paths are compared
+const model = load('model'), teams = load('teams');
+const fixtures = load('fixtures').sort((a, b) => (b.market ? 1 : 0) - (a.market ? 1 : 0)).slice(0, 80);
+const out = fixtures.map((f) => ({
+  id: f.id, pred: predictMatch(model, teams, f.home, f.away, f.comp, f.neutral, f.market ? f.market.xg : null),
+}));
 console.log(JSON.stringify(out));
 """
 
