@@ -1,0 +1,179 @@
+"""Rolling-origin evaluation: refit on data before each origin, predict the next window.
+
+Every prediction is made only from matches played before it, so the numbers
+are honest out-of-sample results. The baseline is the empirical distribution
+of match totals in the same competition over the previous 365 days.
+"""
+from __future__ import annotations
+
+import itertools
+import logging
+import time
+
+import numpy as np
+import pandas as pd
+
+from . import config, dist
+from .espn import played_mask
+from .model import RateModel, _count_pmf, team_groups
+
+log = logging.getLogger(__name__)
+
+KMAX = {"goals": 20, "corners": config.MAX_CORNERS}
+COLS = {"goals": ("home_goals", "away_goals"), "corners": ("home_corners", "away_corners")}
+EVAL_LINES = {"goals": [1.5, 2.5, 3.5], "corners": [8.5, 9.5, 10.5, 11.5]}
+
+
+def _total_pmf(kind: str, model: RateModel, lh: float, la: float) -> np.ndarray:
+    if kind == "goals":
+        return dist.total_from_matrix(dist.score_matrix(lh, la, model.rho, config.MAX_GOALS))[: KMAX[kind] + 1]
+    return _count_pmf(lh + la, model.dispersion, KMAX[kind])
+
+
+def _baseline_pmf(totals: np.ndarray, kmax: int) -> np.ndarray:
+    counts = np.bincount(np.clip(totals.astype(int), 0, kmax), minlength=kmax + 1).astype(float)
+    counts += 0.5
+    return counts / counts.sum()
+
+
+def _rps(pmf: np.ndarray, k: int) -> float:
+    cdf = np.cumsum(pmf)
+    obs = (np.arange(len(pmf)) >= k).astype(float)
+    return float(np.mean((cdf - obs) ** 2))
+
+
+def rolling(
+    matches: pd.DataFrame,
+    start: str,
+    end: str | pd.Timestamp,
+    step_days: int = 7,
+    kinds: tuple[str, ...] = ("goals", "corners"),
+    params: dict[str, dict] | None = None,
+    comps: list[str] | None = None,
+) -> pd.DataFrame:
+    """Out-of-sample predictions for target-competition matches in [start, end)."""
+    params = params or {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS}
+    comps = comps or list(config.TARGET_COMPETITIONS)
+    played = matches[played_mask(matches)]
+    start_ts = pd.Timestamp(start, tz="UTC") if not isinstance(start, pd.Timestamp) else start
+    end_ts = pd.Timestamp(end, tz="UTC") if not isinstance(end, pd.Timestamp) else end
+    origins = pd.date_range(start_ts, end_ts, freq=f"{step_days}D")
+    warm: dict[str, RateModel | None] = {k: None for k in kinds}
+    records = []
+    for t0 in origins:
+        t1 = min(t0 + pd.Timedelta(days=step_days), end_ts)
+        window = played[(played["date"] >= t0) & (played["date"] < t1) & played["comp"].isin(comps)]
+        if window.empty:
+            continue
+        groups = team_groups(matches, t0)
+        history = played[(played["date"] < t0) & (played["date"] >= t0 - pd.Timedelta(days=365))]
+        baselines: dict[tuple[str, str], tuple[np.ndarray, float]] = {}
+
+        def baseline(kind: str, comp: str) -> tuple[np.ndarray, float]:
+            if (kind, comp) not in baselines:
+                yh, ya = COLS[kind]
+                hist = history[history["comp"] == comp][[yh, ya]].dropna().sum(axis=1).to_numpy()
+                if len(hist) < 30:
+                    hist = history[[yh, ya]].dropna().sum(axis=1).to_numpy()
+                baselines[(kind, comp)] = (_baseline_pmf(hist, KMAX[kind]), float(hist.mean()))
+            return baselines[(kind, comp)]
+
+        fitted = {}
+        for kind in kinds:
+            yh, ya = COLS[kind]
+            m = RateModel.from_params(params[kind]).fit(played, yh, ya, t0, groups, warm=warm[kind])
+            if kind == "goals":
+                m.fit_rho()
+            fitted[kind] = warm[kind] = m
+        for row in window.itertuples(index=False):
+            rec = {
+                "event_id": row.event_id, "date": row.date, "comp": row.comp,
+                "home_id": row.home_id, "away_id": row.away_id, "neutral": row.neutral,
+            }
+            for kind in kinds:
+                yh, ya = COLS[kind]
+                ah, aa = getattr(row, yh), getattr(row, ya)
+                if pd.isna(ah) or pd.isna(aa):
+                    continue
+                model = fitted[kind]
+                lh, la = model.rates(row.home_id, row.away_id, row.comp, bool(row.neutral))
+                pmf = _total_pmf(kind, model, lh, la)
+                base, base_mean = baseline(kind, row.comp)
+                actual = int(ah + aa)
+                kk = min(actual, KMAX[kind])
+                rec.update({
+                    f"{kind}_home_pred": lh, f"{kind}_away_pred": la, f"{kind}_pred": lh + la,
+                    f"{kind}_base": base_mean, f"{kind}_actual": actual,
+                    f"{kind}_home_actual": int(ah), f"{kind}_away_actual": int(aa),
+                    f"{kind}_logp": float(np.log(max(pmf[kk], 1e-12))),
+                    f"{kind}_base_logp": float(np.log(base[kk])),
+                    f"{kind}_rps": _rps(pmf, kk), f"{kind}_base_rps": _rps(base, kk),
+                })
+                for line in EVAL_LINES[kind]:
+                    rec[f"{kind}_p_over_{line}"] = dist.p_over(pmf, line)
+                    rec[f"{kind}_base_p_over_{line}"] = dist.p_over(base, line)
+            records.append(rec)
+    return pd.DataFrame(records)
+
+
+def summarise(preds: pd.DataFrame, kind: str) -> dict:
+    """Headline accuracy metrics for one target (goals or corners), model vs baseline."""
+    df = preds.dropna(subset=[f"{kind}_actual"])
+    if df.empty:
+        return {}
+    y = df[f"{kind}_actual"].to_numpy(float)
+    pred, base = df[f"{kind}_pred"].to_numpy(), df[f"{kind}_base"].to_numpy()
+    out = {
+        "n": int(len(df)),
+        "mae": float(np.mean(np.abs(pred - y))), "base_mae": float(np.mean(np.abs(base - y))),
+        "rmse": float(np.sqrt(np.mean((pred - y) ** 2))), "base_rmse": float(np.sqrt(np.mean((base - y) ** 2))),
+        "log_score": float(df[f"{kind}_logp"].mean()), "base_log_score": float(df[f"{kind}_base_logp"].mean()),
+        "rps": float(df[f"{kind}_rps"].mean()), "base_rps": float(df[f"{kind}_base_rps"].mean()),
+        "mean_pred": float(pred.mean()), "mean_actual": float(y.mean()),
+        "corr": float(np.corrcoef(pred, y)[0, 1]) if len(y) > 2 else None,
+        "lines": {},
+    }
+    for line in EVAL_LINES[kind]:
+        p, pb = df[f"{kind}_p_over_{line}"].to_numpy(), df[f"{kind}_base_p_over_{line}"].to_numpy()
+        o = (y > line).astype(float)
+        out["lines"][str(line)] = {
+            "brier": float(np.mean((p - o) ** 2)), "base_brier": float(np.mean((pb - o) ** 2)),
+            "hit_rate": float(np.mean((p > 0.5) == (o > 0.5))),
+            "base_hit_rate": float(np.mean((pb > 0.5) == (o > 0.5))),
+            "over_rate": float(o.mean()),
+            "calibration": calibration(p, o),
+        }
+    return out
+
+
+def calibration(p: np.ndarray, o: np.ndarray, bins: int = 10) -> list[dict]:
+    edges = np.linspace(0, 1, bins + 1)
+    idx = np.clip(np.digitize(p, edges) - 1, 0, bins - 1)
+    out = []
+    for b in range(bins):
+        sel = idx == b
+        if sel.sum() >= 15:
+            out.append({"p": float(p[sel].mean()), "freq": float(o[sel].mean()), "n": int(sel.sum())})
+    return out
+
+
+def tune(matches: pd.DataFrame, kind: str, start: str = "2025-08-01", end: str = "2026-06-15",
+         step_days: int = 14, grid: dict | None = None) -> pd.DataFrame:
+    """Grid search over hyperparameters on a validation window, scored by mean log score."""
+    grid = grid or {
+        "half_life_days": [180.0, 270.0, 365.0, 540.0],
+        "lam_team": [2.0, 5.0, 10.0, 20.0],
+        "lam_comp": [5.0, 50.0],
+    }
+    base = dict(config.GOALS_PARAMS if kind == "goals" else config.CORNERS_PARAMS)
+    keys = list(grid)
+    rows = []
+    for combo in itertools.product(*(grid[k] for k in keys)):
+        params = {**base, **dict(zip(keys, combo))}
+        t = time.time()
+        preds = rolling(matches, start, end, step_days, kinds=(kind,), params={kind: params})
+        s = summarise(preds, kind)
+        rows.append({**dict(zip(keys, combo)), "log_score": s["log_score"], "rps": s["rps"], "mae": s["mae"],
+                     "base_log_score": s["base_log_score"], "n": s["n"]})
+        log.info("%s %s -> log %.4f rps %.4f mae %.3f (%.0fs)", kind, dict(zip(keys, combo)), s["log_score"], s["rps"], s["mae"], time.time() - t)
+    return pd.DataFrame(rows).sort_values("log_score", ascending=False)

@@ -1,0 +1,8 @@
+# Downloaded and generated data (rebuilt by `python -m predictor update`)
+data/
+web/data/
+dist/
+
+__pycache__/
+*.pyc
+.pytest_cache/

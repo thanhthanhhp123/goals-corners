@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Goals &amp; Corners Predictor</title>
+  <meta name="description" content="Predicted total goals and total corners for every Premier League, LaLiga, Serie A, Bundesliga, Ligue 1 and Champions League match.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232a78d6'/%3E%3Cpath d='M9 23V9l12 7z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="#fixtures">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14"/><path d="M9 23V9l12 7z"/></svg>
+        <span>Goals &amp; Corners <b>Predictor</b></span>
+      </a>
+      <nav class="tabs" aria-label="Views">
+        <a href="#fixtures" data-view="fixtures">Fixtures</a>
+        <a href="#results" data-view="results">Results</a>
+        <a href="#tool" data-view="tool">Match tool</a>
+        <a href="#teams" data-view="teams">Teams</a>
+        <a href="#model" data-view="model">Model</a>
+      </nav>
+      <div class="status">
+        <span id="updated" class="muted"></span>
+        <button id="refresh" class="btn ghost" type="button" hidden>Refresh data</button>
+        <button id="theme" class="btn ghost icon" type="button" aria-label="Toggle colour theme" title="Toggle colour theme">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section id="filters" class="filters" aria-label="Filters"></section>
+    <section id="view" aria-live="polite"></section>
+  </main>
+
+  <footer class="wrap footer muted">
+    Data: ESPN public scoreboards. Predictions are for regulation time (90 minutes plus stoppage time) and are estimates, not guarantees.
+  </footer>
+
+  <dialog id="match" aria-labelledby="match-title">
+    <div class="dialog-body"></div>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

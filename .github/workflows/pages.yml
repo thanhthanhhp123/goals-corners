@@ -1,0 +1,58 @@
+# Rebuilds the predictions every 6 hours and publishes web/ to GitHub Pages.
+# One-time setup: repo Settings → Pages → Source: "GitHub Actions".
+name: Update predictions
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # ESPN downloads and finished backtest weeks, so later runs take about a minute.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/raw
+            data/backtest_*.pkl
+          key: espn-${{ github.run_id }}
+          restore-keys: espn-
+
+      - run: python -m predictor update
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
