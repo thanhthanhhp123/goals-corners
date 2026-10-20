@@ -18,6 +18,10 @@ For each fixture you get:
 
 Other views:
 
+- **Lên thuyền** ("get on the boat") suggests picks: the model's strongest over/under calls
+  for the coming days, with our chance, the competition's usual rate, break-even odds and the
+  best bookmaker price where we have one. Picks can be added to a boat (a combo) to see the
+  chance that they all win. Below the list, the same rule's record over past matches.
 - **Results** shows every finished match this season next to the prediction made *before*
   kick-off, with running hit rates.
 - **Match tool** predicts any pairing of clubs, including clubs from different leagues.
@@ -115,6 +119,14 @@ only the pre-closing odds, which were public a day or more before kick-off. 2026
 held out from tuning. Results are cached in `data/backtest_*.pkl`, so later builds only
 compute new weeks.
 
+**Picks** (`predictor/tips.py`). For each match and market (total goals at 1.5/2.5/3.5,
+total corners at 8.5–11.5) the pick is the side whose chance is furthest above the
+competition's own rate at that line over the past year, if the chance is between 60% and 85%
+and at least 8 points above that rate. Taking the most likely side instead would keep
+listing calls such as "under 11.5 corners" that hold in most matches. The thresholds were set
+for a manageable number of picks (about 20–25 a week), not tuned for results. The same rule
+runs over the backtest to give the record on the page.
+
 ## Layout
 
 ```
@@ -124,6 +136,7 @@ predictor/            Python package
   model.py            rating models and match predictions
   dist.py             Poisson / negative-binomial / Dixon–Coles helpers
   backtest.py         rolling evaluation, metrics, tuning
+  tips.py             pick suggestions (Lên thuyền) and their track record
   build.py            end-to-end build → web/data/*.json
   server.py           static server + /api/refresh, /api/status
   export.py           single-file HTML export
@@ -163,6 +176,13 @@ beating them: their margin averaged 6.8%, and backing every over/under 2.5 "edge
 the best price across bookmakers returned −5.5% over 113 bets in 2025-26 and −36% over 67 bets
 so far in 2026-27. The site shows edges, but treat them as hints. Corner odds are not in the
 free data, so the corner forecasts are only tested against results.
+
+**Picks.** The Lên thuyền picks win about as often as they say. Of 1,090 picks in 2025-26
+(stated 70% on average) 68% won; of 191 in 2026-27 to 20 Oct (stated 70%) 72% won. That makes them
+likely, not profitable: the 233 over/under 2.5 picks of 2025-26 that had odds returned −10%
+at the average price (±4%) and −8% at the best price, because the bookmakers usually rate
+the same side as likely and price it short. 2026-27 to 20 Oct: +1.5% over 46 picks (±9%), which
+is within noise.
 
 ## Limits
 

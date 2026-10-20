@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import backtest, config, espn, market
+from . import backtest, config, espn, market, tips
 from .model import MatchPredictor, fit_predictor
 
 log = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ def season_metrics(preds: pd.DataFrame) -> list[dict]:
         if sel.empty:
             continue
         entry = {**season, "goals": _round_tree(backtest.summarise(sel, "goals")), "corners": _round_tree(backtest.summarise(sel, "corners")),
-                 "market": _round_tree(market_metrics(sel)), "by_comp": {}}
+                 "market": _round_tree(market_metrics(sel)), "tips": _round_tree(tips.summarise(tips.history(sel))), "by_comp": {}}
         for comp in config.TARGET_COMPETITIONS:
             sc = sel[sel["comp"] == comp]
             if len(sc) >= 10:
@@ -217,6 +217,15 @@ def _market_json(predictor: MatchPredictor, row, mk) -> dict | None:
     }
 
 
+def _tip_json(t: dict) -> dict:
+    out = {"kind": t["kind"], "line": t["line"], "side": t["side"], "p": _r(t["p"], 4), "base": _r(t["base"], 4)}
+    if "won" in t:
+        out["won"] = bool(t["won"])
+        if pd.notna(t.get("price")):
+            out["price"], out["best"] = _r(t["price"], 2), _r(t["best"], 2)
+    return out
+
+
 def _confidence(predictor: MatchPredictor, home: str, away: str) -> str:
     n = min(predictor.corners.n_eff.get(home, 0.0), predictor.corners.n_eff.get(away, 0.0),
             predictor.goals.n_eff.get(home, 0.0), predictor.goals.n_eff.get(away, 0.0))
@@ -248,6 +257,7 @@ def build(force_fetch: bool = True) -> dict:
     predictor = fit_predictor(matches, now)
 
     log.info("predicting fixtures")
+    bases = tips.base_rates(played, config.TARGET_COMPETITIONS, now)
     upcoming = matches[
         matches["comp"].isin(config.TARGET_COMPETITIONS)
         & matches["state"].isin(["pre", "in"])
@@ -260,20 +270,24 @@ def build(force_fetch: bool = True) -> dict:
             continue
         mk = (row.mkp_home, row.mkp_away)
         mk = mk if np.all(np.isfinite(mk)) else None
-        pred = predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral), market=mk)
+        pred = _prediction_json(predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral), market=mk))
         fixtures.append({
             "id": row.event_id, "comp": row.comp, "date": row.date.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "state": row.state, "status": row.status, "neutral": bool(row.neutral), "venue": row.venue,
             "home": row.home_id, "away": row.away_id,
             "confidence": _confidence(predictor, row.home_id, row.away_id),
             "market": _market_json(predictor, row, mk),
-            **_prediction_json(pred),
+            **pred,
+            "tips": [_tip_json(t) for t in tips.fixture_tips(pred, bases[row.comp])],
         })
 
     log.info("backtesting")
     preds = cached_backtest(matches, now)
     metrics = season_metrics(preds)
 
+    picks: dict[str, list[dict]] = {}
+    for t in tips.history(preds).to_dict("records"):
+        picks.setdefault(t["event_id"], []).append(_tip_json(t))
     results = []
     recent = preds[preds["date"] >= pd.Timestamp(SEASONS[-1]["start"], tz="UTC") - pd.Timedelta(days=60)]
     # to_dict, not itertuples: columns like "goals_p_over_2.5" are not valid attribute names
@@ -292,6 +306,8 @@ def build(force_fetch: bool = True) -> dict:
         p_mkt = r.get("mkt_mkp_p_over")
         if p_mkt is not None and not pd.isna(p_mkt) and "goals" in rec:
             rec["goals"]["market_p_over"] = _r(p_mkt, 4)
+        if r["event_id"] in picks:
+            rec["tips"] = picks[r["event_id"]]
         results.append(rec)
 
     log.info("exporting")

@@ -38,6 +38,15 @@ def _baseline_pmf(totals: np.ndarray, kmax: int) -> np.ndarray:
     return counts / counts.sum()
 
 
+def baseline(history: pd.DataFrame, kind: str, comp: str) -> tuple[np.ndarray, float]:
+    """Distribution and mean of match totals in `comp` (all competitions if it has under 30 matches)."""
+    yh, ya = COLS[kind]
+    hist = history[history["comp"] == comp][[yh, ya]].dropna().sum(axis=1).to_numpy()
+    if len(hist) < 30:
+        hist = history[[yh, ya]].dropna().sum(axis=1).to_numpy()
+    return _baseline_pmf(hist, KMAX[kind]), float(hist.mean())
+
+
 def _rps(pmf: np.ndarray, k: int) -> float:
     cdf = np.cumsum(pmf)
     obs = (np.arange(len(pmf)) >= k).astype(float)
@@ -78,15 +87,6 @@ def rolling(
         history = played[(played["date"] < t0) & (played["date"] >= t0 - pd.Timedelta(days=365))]
         baselines: dict[tuple[str, str], tuple[np.ndarray, float]] = {}
 
-        def baseline(kind: str, comp: str) -> tuple[np.ndarray, float]:
-            if (kind, comp) not in baselines:
-                yh, ya = COLS[kind]
-                hist = history[history["comp"] == comp][[yh, ya]].dropna().sum(axis=1).to_numpy()
-                if len(hist) < 30:
-                    hist = history[[yh, ya]].dropna().sum(axis=1).to_numpy()
-                baselines[(kind, comp)] = (_baseline_pmf(hist, KMAX[kind]), float(hist.mean()))
-            return baselines[(kind, comp)]
-
         fitted = {}
         for kind in kinds:
             yh, ya = COLS[kind]
@@ -125,7 +125,9 @@ def rolling(
                     rec["goals_model_pred"] = sum(raw[kind])
                     for line in EVAL_LINES[kind]:
                         rec[f"goals_model_p_over_{line}"] = dist.p_over(pmf0, line)
-                base, base_mean = baseline(kind, row.comp)
+                if (kind, row.comp) not in baselines:
+                    baselines[(kind, row.comp)] = baseline(history, kind, row.comp)
+                base, base_mean = baselines[(kind, row.comp)]
                 actual = int(ah + aa)
                 kk = min(actual, KMAX[kind])
                 rec.update({

@@ -2,7 +2,7 @@ import { predictMatch } from './model.js';
 import { distributionChart, calibrationChart, hideTip } from './charts.js';
 
 const TARGETS = ['eng.1', 'esp.1', 'ita.1', 'ger.1', 'fra.1', 'uefa.champions'];
-const VIEWS = ['fixtures', 'results', 'tool', 'teams', 'model'];
+const VIEWS = ['fixtures', 'tips', 'results', 'tool', 'teams', 'model'];
 const RESULT_LINES = { goals: ['1.5', '2.5', '3.5'], corners: ['8.5', '9.5', '10.5', '11.5'] };
 
 // ------------------------------------------------------------------ storage
@@ -30,6 +30,10 @@ const state = {
   teamSort: { key: 'gf', dir: -1 },
   season: null,
   tool: store.get('tool', null),
+  tipsRange: store.get('tipsRange', '3'),
+  tipsMarket: store.get('tipsMarket', 'all'),
+  tipsSort: store.get('tipsSort', 'date'),
+  boat: store.get('boat', []),
 };
 
 let D = null;
@@ -59,6 +63,8 @@ function icon(kind, title) {
     warn: 'M12 3 2 21h20L12 3zm0 6v6m0 3v.5',
     check: 'M5 12.5 10 17 19 7',
     cross: 'M6 6l12 12M18 6 6 18',
+    plus: 'M12 5v14M5 12h14',
+    boat: 'M3 14h18l-2.5 5h-13L3 14zM12 3v11M12 4l6 8h-6',
   };
   const p = document.createElementNS(SVGNS, 'path');
   p.setAttribute('d', paths[kind]);
@@ -180,6 +186,16 @@ function renderFilters() {
         (v) => { state.resultsRange = v; store.set('resultsRange', v); renderView(); }),
       select('Goals line', gl, RESULT_LINES.goals.map((l) => [l, l]), (v) => { state.goalLine = v; store.set('goalLine', v); renderView(); }),
       select('Corners line', cl, RESULT_LINES.corners.map((l) => [l, l]), (v) => { state.cornerLine = v; store.set('cornerLine', v); renderView(); }),
+      searchBox(),
+    );
+  } else if (state.view === 'tips') {
+    box.append(
+      select('Show', state.tipsRange, [['1', 'Next 24 hours'], ['3', 'Next 3 days'], ['7', 'Next 7 days'], ['14', 'Next 14 days']],
+        (v) => { state.tipsRange = v; store.set('tipsRange', v); renderView(); }),
+      select('Market', state.tipsMarket, [['all', 'Goals and corners'], ['goals', 'Goals'], ['corners', 'Corners']],
+        (v) => { state.tipsMarket = v; store.set('tipsMarket', v); renderView(); }),
+      select('Sort', state.tipsSort, [['date', 'Kick-off'], ['p', 'Most likely'], ['lift', 'Furthest above league rate']],
+        (v) => { state.tipsSort = v; store.set('tipsSort', v); renderView(); }),
       searchBox(),
     );
   } else if (state.view === 'teams') {
@@ -339,6 +355,230 @@ function openResult(r) {
   const neutral = !!r.neutral;
   const pred = predictMatch(D.model, D.teams, r.home, r.away, r.comp, neutral);
   openMatch({ id: r.id, comp: r.comp, date: r.date, home: r.home, away: r.away, neutral, ...pred, result: r, confidence: 'high' });
+}
+
+// ------------------------------------------------------------------ lên thuyền (picks)
+const pickLabel = (t) => `${t.side === 'over' ? 'Over' : 'Under'} ${t.line} ${t.kind}`;
+const matchName = (m) => `${team(m.home).name} v ${team(m.away).name}`;
+const wantKind = (t) => state.tipsMarket === 'all' || t.kind === state.tipsMarket;
+let boatOpen = false;
+
+function allPicks() {
+  const out = [];
+  for (const f of D.fixtures) for (const t of f.tips ?? []) out.push({ f, t, key: `${f.id}:${t.kind}` });
+  return out;
+}
+
+/** Bookmaker prices for a pick, when our data has them (over/under 2.5 goals in league games). */
+function pickPrices(f, t) {
+  if (t.kind !== 'goals' || t.line !== 2.5 || !f.market) return null;
+  const o = f.market.odds;
+  return t.side === 'over' ? { avg: o.over, best: o.best_over } : { avg: o.under, best: o.best_under };
+}
+
+function setBoat(keys) {
+  state.boat = keys;
+  store.set('boat', keys);
+  renderBoat();
+}
+
+function boatToggle(key, t, f) {
+  return h('button', {
+    class: 'boat-toggle', type: 'button', 'data-key': key, 'data-label': `${pickLabel(t)}, ${matchName(f)}`,
+    onclick: () => setBoat(state.boat.includes(key) ? state.boat.filter((k) => k !== key) : [...state.boat, key]),
+  });
+}
+
+function tipRow({ f, t, key }, showDate) {
+  const d = new Date(f.date);
+  const prices = pickPrices(f, t);
+  const ev = prices?.best ? t.p * prices.best - 1 : null;
+  const open = () => openMatch(f);
+  return h('div', { class: 'tip' },
+    boatToggle(key, t, f),
+    h('div', { class: 'time' }, timeStr(d), h('small', {}, showDate ? `${shortDate(d)} · ${compShort(f.comp)}` : compShort(f.comp))),
+    h('div', {
+      class: 'tip-match', role: 'button', tabindex: 0, 'aria-label': `${matchName(f)}, details`,
+      onclick: open, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } },
+    },
+    h('div', { class: 'team' }, logo(f.home), h('span', {}, team(f.home).name)),
+    h('div', { class: 'team' }, logo(f.away), h('span', {}, team(f.away).name))),
+    h('div', { class: 'pick' },
+      h('div', { class: 'pick-label' }, h('span', { class: `key ${t.kind}` }), pickLabel(t)),
+      h('div', { class: 'pick-sub' }, `Expected ${f1(f[t.kind].total)} ${t.kind}`)),
+    h('div', { class: 'chance' },
+      h('div', { class: 'top' }, h('b', {}, pct(t.p)), h('span', { class: 'muted' }, `league ${pct(t.base)}`)),
+      h('div', { class: `meter ${t.kind}`, role: 'img', 'aria-label': `${pct(t.p)} chance; ${pct(t.base)} in a typical ${compShort(f.comp)} match` },
+        h('i', { style: `width:${Math.round(t.p * 100)}%` }), h('b', { class: 'base', style: `left:${(t.base * 100).toFixed(1)}%` }))),
+    h('div', { class: 'price' },
+      h('span', {}, 'Break-even odds ', h('b', {}, odds(t.p))),
+      prices?.best
+        ? h('span', {}, `Best price ${f2(prices.best)} · `, h('span', { class: ev > VALUE_EDGE ? 'edge-pos' : 'muted' }, signedPct(ev)))
+        : h('span', { class: 'muted' }, noPriceReason(f, t))));
+}
+
+function noPriceReason(f, t) {
+  if (t.kind === 'corners') return 'No corner prices in our data';
+  if (f.comp.startsWith('uefa.')) return 'No Champions League prices in our data';
+  if (t.line !== 2.5) return 'Our data prices the 2.5 line only';
+  return 'No bookmaker price yet';
+}
+
+function renderBoat() {
+  for (const b of document.querySelectorAll('.boat-toggle')) {
+    const on = state.boat.includes(b.dataset.key);
+    b.setAttribute('aria-pressed', String(on));
+    b.setAttribute('aria-label', `${on ? 'Remove from' : 'Add to'} your boat: ${b.dataset.label}`);
+    b.replaceChildren(icon(on ? 'check' : 'plus'));
+  }
+  const box = document.getElementById('boat');
+  if (!box) return;
+  const byKey = new Map(allPicks().map((x) => [x.key, x]));
+  const legs = state.boat.map((k) => byKey.get(k)).filter(Boolean);
+  if (legs.length !== state.boat.length) { state.boat = legs.map((x) => x.key); store.set('boat', state.boat); }
+  box.hidden = !legs.length;
+  if (!legs.length) { box.replaceChildren(); return; }
+
+  const p = legs.reduce((s, x) => s * x.t.p, 1);
+  const price = h('input', { type: 'number', inputmode: 'decimal', min: '1.01', step: '0.01', placeholder: 'e.g. 3.20', 'aria-label': 'Decimal odds for the whole boat' });
+  const out = h('span', { role: 'status' });
+  price.addEventListener('input', () => {
+    const o = Number(price.value);
+    out.replaceChildren(o > 1 ? h('span', {}, 'expected return ', h('b', { class: p * o - 1 > VALUE_EDGE ? 'edge-pos' : '' }, signedPct(p * o - 1))) : '');
+  });
+  const sameMatch = new Set(legs.map((x) => x.f.id)).size < legs.length;
+  box.replaceChildren(h('div', {},
+    h('div', { class: 'boat-bar' },
+      h('span', { class: 'boat-title' }, icon('boat'), h('b', {}, 'Your boat'), ` · ${legs.length} ${legs.length === 1 ? 'pick' : 'picks'}`),
+      h('span', {}, legs.length === 1 ? 'Wins ' : 'All win ', h('b', {}, pct(p))),
+      h('span', {}, 'Break-even odds ', h('b', {}, odds(p))),
+      h('span', { class: 'boat-actions' },
+        h('button', { class: 'btn ghost', type: 'button', 'aria-expanded': String(boatOpen), onclick: () => { boatOpen = !boatOpen; renderBoat(); } },
+          boatOpen ? 'Hide picks' : 'Show picks'),
+        h('button', { class: 'btn ghost', type: 'button', onclick: () => setBoat([]) }, 'Clear'))),
+    boatOpen ? h('div', { class: 'boat-body' },
+      h('ul', { class: 'boat-legs' }, legs.map((x) => h('li', {},
+        h('span', {}, h('span', { class: `key ${x.t.kind}` }), h('b', {}, pickLabel(x.t)),
+          h('span', { class: 'muted' }, ` · ${matchName(x.f)} · ${shortDate(new Date(x.f.date))} ${timeStr(new Date(x.f.date))}`)),
+        h('span', { class: 'leg-p' }, pct(x.t.p),
+          h('button', {
+            class: 'btn ghost icon close', type: 'button', 'aria-label': `Remove ${pickLabel(x.t)}, ${matchName(x.f)}`,
+            onclick: () => setBoat(state.boat.filter((k) => k !== x.key)),
+          }, icon('cross')))))),
+      h('div', { class: 'checker' }, h('label', { class: 'field' }, 'Your bookmaker\'s price for the whole boat', price), out),
+      h('p', { class: 'small muted' },
+        'The chance that all picks win multiplies their chances. ',
+        sameMatch ? 'Goals and corners picks from the same match are related, so for those the combined chance is only approximate. ' : '',
+        'The bookmaker\'s margin is charged on every leg, so a combo usually pays well under the break-even odds.')) : null));
+}
+
+function tipsRecord(view) {
+  const seasons = D.meta.metrics.filter((s) => s.tips);
+  if (!seasons.length) return;
+  const rate = (x) => (x ? `${pct(x.hit)} of ${x.n.toLocaleString()}` : '–');
+  const roi = (o, k) => (o ? `${signedPct(o[k].roi)} (±${Math.round((o[k].roi_se ?? 0) * 100)}%)` : '–');
+  view.append(h('div', { class: 'section-title' }, 'How past picks did'),
+    h('div', { class: 'card table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Season', 'Picks', 'Won', 'We said', 'Goals picks', 'Corners picks', 'With odds', 'Return, avg price', 'Return, best price']
+        .map((t, i) => h('th', { class: i === 0 ? 'left' : '' }, t)))),
+      h('tbody', {}, seasons.map((s) => {
+        const x = s.tips;
+        return h('tr', {},
+          h('td', { class: 'left' }, s.label, h('span', { class: 'comp-tag' }, s.note)),
+          h('td', {}, x.n.toLocaleString()), h('td', {}, `${x.won.toLocaleString()} (${pct(x.hit)})`), h('td', {}, pct(x.p)),
+          h('td', {}, rate(x.by_kind.goals)), h('td', {}, rate(x.by_kind.corners)),
+          h('td', {}, x.odds ? x.odds.n : 0), h('td', {}, roi(x.odds, 'avg_price')), h('td', {}, roi(x.odds, 'best_price')));
+      })))));
+
+  const tiers = seasons[0].tips.tiers.map((t) => [t.lo, t.hi]);
+  view.append(h('div', { class: 'card table-wrap', style: 'margin-top:12px;max-width:640px' }, h('table', { class: 'mini-table' },
+    h('thead', {}, h('tr', {}, h('th', { class: 'left' }, 'We said'), seasons.map((s) => h('th', {}, `Happened, ${s.label}`)))),
+    h('tbody', {}, tiers.map(([lo, hi]) => h('tr', {},
+      h('td', { class: 'left' }, hi >= 1 ? `${pct(lo)} or more` : `${pct(lo)}–${pct(hi)}`),
+      seasons.map((s) => {
+        const t = s.tips.tiers.find((x) => x.lo === lo);
+        return h('td', {}, t ? `${pct(t.hit)} of ${t.n}` : '–');
+      })))))));
+  view.append(h('p', { class: 'small muted' },
+    'Past picks come from the weekly backtest: each week the model was refitted on earlier matches only and the same rule was applied to its forecasts. ',
+    'When "Happened" is close to "We said", the chances are honest. "Return" is what one-unit bets on every pick returned at the bookmakers\' pre-closing prices; ',
+    'only over/under 2.5 goals picks have prices in our data. A likely pick is not the same as a good bet: the bookmakers usually see the same thing and price it short.'));
+}
+
+function recentPicks(view) {
+  const from = Date.now() - 14 * 864e5;
+  const rows = [];
+  for (const r of D.results) {
+    if (!r.tips || !matchesFilter(r) || Date.parse(r.date) < from) continue;
+    for (const t of r.tips) if (wantKind(t) && r[t.kind]) rows.push({ r, t });
+  }
+  if (!rows.length) return;
+  rows.sort((a, b) => b.r.date.localeCompare(a.r.date));
+  const won = rows.filter((x) => x.t.won).length;
+  const said = rows.reduce((s, x) => s + x.t.p, 0) / rows.length;
+  view.append(h('div', { class: 'section-title' }, 'Picks in the last 14 days'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, `${won} of ${rows.length} won (${pct(won / rows.length)}); on average we gave them ${pct(said)}.`),
+    h('div', { class: 'card table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Date', 'Match', 'Pick', 'Chance', 'Result'].map((t, i) => h('th', { class: i < 3 ? 'left' : '' }, t)))),
+      h('tbody', {}, rows.slice(0, 150).map(({ r, t }) => h('tr', { class: 'clickable', onclick: () => openResult(r) },
+        h('td', { class: 'left muted' }, shortDate(new Date(r.date)), h('span', { class: 'comp-tag' }, compShort(r.comp))),
+        h('td', { class: 'left' }, matchName(r), r.goals ? h('span', { class: 'muted' }, ` ${r.goals.home_actual}–${r.goals.away_actual}`) : null),
+        h('td', { class: 'left' }, h('span', { class: `key ${t.kind}` }), pickLabel(t)),
+        h('td', {}, pct(t.p)),
+        h('td', {}, h('span', { class: `verdict ${t.won ? 'ok' : 'miss'}` }, icon(t.won ? 'check' : 'cross'), `${r[t.kind].actual} ${r[t.kind].actual === 1 ? t.kind.slice(0, -1) : t.kind}`))))))));
+}
+
+function renderTips(view) {
+  const horizon = Date.now() + Number(state.tipsRange) * 864e5;
+  const picks = allPicks().filter(({ f, t }) => f.state === 'pre' && wantKind(t) && matchesFilter(f) && Date.parse(f.date) <= horizon);
+  const key = { p: (x) => -x.t.p, lift: (x) => x.t.base - x.t.p }[state.tipsSort];
+  picks.sort(key ? (a, b) => key(a) - key(b) : (a, b) => a.f.date.localeCompare(b.f.date));
+
+  const seasons = D.meta.metrics.filter((s) => s.tips);
+  const rule = seasons.at(-1)?.tips.rule ?? { min_prob: 0.6, min_lift: 0.08 };
+  view.append(h('p', { class: 'intro' },
+    'The model\'s strongest over/under calls for the coming days. A match gets a pick when our chance for one side of a line is at least ',
+    pct(rule.min_prob), ` and at least ${Math.round(rule.min_lift * 100)} points above how often that side lands in the competition (last 12 months). `,
+    'Tap + to put picks in your boat and see the chance that they all win.'));
+
+  const sum = (fn) => seasons.reduce((s, x) => s + fn(x.tips), 0);
+  const n = sum((x) => x.n), nOdds = sum((x) => x.odds?.n ?? 0);
+  const matches = new Set(picks.map((x) => x.f.id)).size;
+  view.append(h('div', { class: 'summary-row' },
+    tile('Picks', picks.length, `${matches} ${matches === 1 ? 'match' : 'matches'} · next ${state.tipsRange === '1' ? '24 hours' : `${state.tipsRange} days`}`),
+    n ? tile(`Past picks won, since ${seasons[0].label}`, pct(sum((x) => x.won) / n),
+      `${sum((x) => x.won).toLocaleString()} of ${n.toLocaleString()} · we said ${pct(sum((x) => x.p * x.n) / n)}`) : null,
+    nOdds ? tile('Return at bookmaker prices', signedPct(sum((x) => (x.odds ? x.odds.avg_price.roi * x.odds.n : 0)) / nOdds),
+      `${nOdds} past over/under 2.5 picks, average price`) : null));
+
+  if (!picks.length) {
+    view.append(h('div', { class: 'card empty' }, D.fixtures.some((f) => f.tips?.length)
+      ? 'No picks match these filters. Try a longer time window.' : 'No picks for the coming fixtures yet.'));
+  } else {
+    const head = h('div', { class: 'tip-head', 'aria-hidden': 'true' },
+      h('div', {}), h('div', {}, 'Time'), h('div', {}, 'Match'), h('div', {}, 'Pick'), h('div', {}, 'Chance'), h('div', {}, 'Price'));
+    if (state.tipsSort !== 'date') {
+      view.append(h('div', { class: 'card' }, head, picks.map((x) => tipRow(x, true))));
+    } else {
+      const days = new Map();
+      for (const x of picks) {
+        const k = dayKey(new Date(x.f.date));
+        if (!days.has(k)) days.set(k, []);
+        days.get(k).push(x);
+      }
+      let first = true;
+      for (const xs of days.values()) {
+        view.append(h('div', { class: 'day' },
+          h('h3', {}, dayLabel(new Date(xs[0].f.date))),
+          h('div', { class: 'card' }, first ? head : null, xs.map((x) => tipRow(x, false)))));
+        first = false;
+      }
+    }
+  }
+  view.append(h('div', { id: 'boat', class: 'card boat', role: 'region', 'aria-label': 'Your boat', hidden: true }));
+  renderBoat();
+  tipsRecord(view);
+  recentPicks(view);
 }
 
 // ------------------------------------------------------------------ detail
@@ -557,6 +797,10 @@ export function matchDetail(f, { closable }) {
       `Before kick-off the model expected ${r.goals ? f1(r.goals.pred) : '–'} goals and ${r.corners ? f1(r.corners.pred) : '–'} corners. `,
       r.goals?.market_p_over != null ? `Over 2.5 goals: ${pct(r.goals.p_over['2.5'])} from us, ${pct(r.goals.market_p_over)} from the bookmakers. ` : '',
       'The distributions below use the current ratings.')));
+  }
+  if (f.tips?.length && !f.result) {
+    notes.push(h('div', { class: 'note' }, h('span', {},
+      h('a', { href: '#tips' }, 'Lên thuyền'), ': ', f.tips.map((t) => `${pickLabel(t)} (${pct(t.p)})`).join(' · '))));
   }
   if (f.confidence === 'low' || f.confidence === 'medium') {
     notes.push(h('div', { class: 'note' }, icon('warn'),
@@ -798,7 +1042,7 @@ function renderView() {
   hideTip();
   const view = document.getElementById('view');
   view.replaceChildren();
-  ({ fixtures: renderFixtures, results: renderResults, tool: renderTool, teams: renderTeams, model: renderModel })[state.view](view);
+  ({ fixtures: renderFixtures, tips: renderTips, results: renderResults, tool: renderTool, teams: renderTeams, model: renderModel })[state.view](view);
 }
 
 function render() {

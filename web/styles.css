@@ -326,6 +326,53 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 .calib .chart { max-width: 380px; margin: 4px auto 0; }
 .season-switch { margin: 4px 0 12px; }
 
+/* ---------------------------------------------------------------- lên thuyền */
+.intro { max-width: 760px; color: var(--ink-2); margin: 0 0 12px; }
+.tip-head, .tip {
+  display: grid;
+  grid-template-columns: 32px 76px minmax(0, 1.2fr) minmax(0, 1fr) 150px minmax(0, 1fr);
+  align-items: center; gap: 10px; padding: 10px 14px;
+}
+.tip-head { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; padding-top: 4px; padding-bottom: 4px; }
+.tip { border-top: 1px solid var(--border); }
+.tip-head + .tip, .card > .tip:first-child { border-top: 0; }
+.tip .time { color: var(--ink-2); font-variant-numeric: tabular-nums; font-size: 13px; }
+.tip .time small { display: block; color: var(--muted); font-size: 11px; }
+.tip-match { display: grid; gap: 4px; min-width: 0; cursor: pointer; border-radius: 6px; }
+.tip-match:hover span { text-decoration: underline; }
+.pick { min-width: 0; }
+.pick-label { font-weight: 650; display: flex; align-items: center; gap: 8px; }
+.pick-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
+td .key, .boat-legs .key { margin-right: 6px; vertical-align: -1px; }
+.chance { display: grid; gap: 4px; }
+.chance .top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 12px; }
+.chance .top b { font-size: 15px; }
+.meter { position: relative; }
+.meter .base { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--ink); opacity: 0.55; }
+.price { display: grid; gap: 2px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.boat-toggle {
+  width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface);
+  cursor: pointer; display: grid; place-items: center; color: var(--ink-2); padding: 0;
+}
+.boat-toggle:hover { background: var(--surface-2); color: var(--ink); }
+.boat-toggle[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: var(--accent-ink); }
+.boat-toggle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.boat { position: sticky; bottom: 12px; z-index: 5; margin-top: 16px; padding: 10px 16px; border-color: var(--accent); }
+.boat-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; font-variant-numeric: tabular-nums; }
+.boat-bar b { font-weight: 650; }
+.boat-title { display: inline-flex; align-items: center; gap: 6px; }
+.boat-title svg { width: 20px; height: 20px; fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+.boat-actions { margin-left: auto; display: flex; gap: 4px; }
+.boat-body { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; max-height: 50vh; overflow-y: auto; }
+.boat-legs { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; font-size: 13px; }
+.boat-legs li { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.boat-legs li > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.leg-p { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.boat .checker { align-items: center; gap: 6px 12px; font-size: 13px; }
+.boat .checker input { width: 110px; }
+tr.clickable { cursor: pointer; }
+
 .footer { padding-block: 32px 40px; font-size: 12px; }
 
 /* ---------------------------------------------------------------- responsive */
@@ -345,6 +392,18 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
   .fx .c-goals { grid-area: goals; }
   .fx .c-corners { grid-area: corners; }
   .fx .conf { grid-area: conf; align-self: start; }
+  .tip-head { display: none; }
+  .tip {
+    grid-template-columns: 32px minmax(0, 1fr) 120px;
+    grid-template-areas: "toggle match time" "toggle pick chance" "toggle price price";
+    row-gap: 8px;
+  }
+  .tip .boat-toggle { grid-area: toggle; align-self: start; }
+  .tip .time { grid-area: time; align-self: start; text-align: right; }
+  .tip-match { grid-area: match; }
+  .tip .pick { grid-area: pick; }
+  .tip .chance { grid-area: chance; }
+  .tip .price { grid-area: price; display: flex; flex-wrap: wrap; gap: 2px 14px; }
   .detail-grid, .form-grid { grid-template-columns: 1fr; }
   .matchup .side { font-size: 15px; }
   .matchup img, .matchup .logo-ph { width: 30px; height: 30px; }
