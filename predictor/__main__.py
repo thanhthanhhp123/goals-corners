@@ -28,7 +28,7 @@ def main() -> None:
     p_bt.add_argument("--step", type=int, default=7)
 
     p_tune = sub.add_parser("tune", help="grid-search hyperparameters on the validation season")
-    p_tune.add_argument("--kind", choices=["goals", "corners"], required=True)
+    p_tune.add_argument("--kind", choices=["goals", "corners", "cards"], required=True)
     p_tune.add_argument("--start", default="2025-08-01")
     p_tune.add_argument("--end", default="2026-06-15")
 

@@ -13,17 +13,19 @@ import time
 import numpy as np
 import pandas as pd
 
-from . import config, dist
+from . import config, dist, tips
 from .espn import played_mask
-from .model import RateModel, _count_pmf, team_groups, with_market
+from .model import RateModel, _count_pmf, fit_half, half_matrix, team_groups, with_market
 
 log = logging.getLogger(__name__)
 
-KMAX = {"goals": 20, "corners": config.MAX_CORNERS}
-COLS = {"goals": ("home_goals", "away_goals"), "corners": ("home_corners", "away_corners")}
+KMAX = {"goals": 20, "corners": config.MAX_CORNERS, "cards": config.MAX_CARDS}
+COLS = {"goals": ("home_goals", "away_goals"), "corners": ("home_corners", "away_corners"), "cards": ("home_cards", "away_cards")}
 MARKET_COLS = {"goals": ("mk_home", "mk_away")}
-MARKET_RECORD = ["mkp_home", "mkp_away", "mkp_p_over", "odds_over", "odds_under", "best_over", "best_under", "mk_margin_ou"]
-EVAL_LINES = {"goals": [1.5, 2.5, 3.5], "corners": [8.5, 9.5, 10.5, 11.5]}
+MARKET_RECORD = ["mkp_home", "mkp_away", "mkp_p_over", "odds_over", "odds_under", "best_over", "best_under", "mk_margin_ou",
+                 "odds_home", "odds_draw", "odds_away", "best_home", "best_draw", "best_away"]
+EVAL_LINES = {"goals": [1.5, 2.5, 3.5], "corners": [8.5, 9.5, 10.5, 11.5], "cards": [3.5, 4.5, 5.5]}
+DEFAULT_PARAMS = {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS, "cards": config.CARDS_PARAMS}
 
 
 def _total_pmf(kind: str, model: RateModel, lh: float, la: float) -> np.ndarray:
@@ -58,7 +60,7 @@ def rolling(
     start: str,
     end: str | pd.Timestamp,
     step_days: int = 7,
-    kinds: tuple[str, ...] = ("goals", "corners"),
+    kinds: tuple[str, ...] = ("goals", "corners", "cards"),
     params: dict[str, dict] | None = None,
     comps: list[str] | None = None,
     blend: float | None = None,
@@ -68,9 +70,10 @@ def rolling(
 
     Matches with pre-closing odds (collected a day or more before kick-off) are
     blended with them exactly as live fixtures are; `goals_model_*` columns keep
-    the model-only numbers.
+    the model-only numbers. With all three kinds, `p|...` and `b|...` columns hold every
+    pick selection's probability and its competition rate (see tips.MARKETS).
     """
-    params = params or {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS}
+    params = {**DEFAULT_PARAMS, **(params or {})}
     comps = comps or list(config.TARGET_COMPETITIONS)
     played = matches[played_mask(matches)]
     start_ts = pd.Timestamp(start, tz="UTC") if not isinstance(start, pd.Timestamp) else start
@@ -86,6 +89,8 @@ def rolling(
         groups = team_groups(matches, t0)
         history = played[(played["date"] < t0) & (played["date"] >= t0 - pd.Timedelta(days=365))]
         baselines: dict[tuple[str, str], tuple[np.ndarray, float]] = {}
+        sel_bases: dict[str, dict] = {}
+        ht = fit_half(played, t0)
 
         fitted = {}
         for kind in kinds:
@@ -99,6 +104,7 @@ def rolling(
             rec = {
                 "event_id": row.event_id, "date": row.date, "comp": row.comp,
                 "home_id": row.home_id, "away_id": row.away_id, "neutral": row.neutral,
+                **{c: getattr(row, c) for cols in tips.COUNTS.values() for c in cols},
             }
             raw = {k: fitted[k].rates(row.home_id, row.away_id, row.comp, bool(row.neutral)) for k in kinds}
             mk = (getattr(row, "mkp_home", np.nan), getattr(row, "mkp_away", np.nan))
@@ -141,6 +147,14 @@ def rolling(
                 for line in EVAL_LINES[kind]:
                     rec[f"{kind}_p_over_{line}"] = dist.p_over(pmf, line)
                     rec[f"{kind}_base_p_over_{line}"] = dist.p_over(base, line)
+            if set(kinds) >= {"goals", "corners", "cards"}:
+                (lh, la), (ch, ca), (kh, ka) = adjusted["goals"], adjusted["corners"], adjusted["cards"]
+                p = tips.probs(dist.score_matrix(lh, la, fitted["goals"].rho, config.MAX_GOALS), half_matrix(lh, la, ht),
+                               _total_pmf("corners", fitted["corners"], ch, ca), _total_pmf("cards", fitted["cards"], kh, ka))
+                if row.comp not in sel_bases:
+                    sel_bases[row.comp] = tips.base_rates(history, row.comp)
+                rec.update({f"p|{tips.key(*k)}": v for k, v in p.items()})
+                rec.update({f"b|{tips.key(*k)}": v for k, v in sel_bases[row.comp].items()})
             records.append(rec)
     return pd.DataFrame(records)
 
@@ -197,7 +211,7 @@ def tune(matches: pd.DataFrame, kind: str, start: str = "2025-08-01", end: str =
         "half_life_days": [180.0, 270.0, 365.0, 540.0],
         "lam_team": [20.0, 40.0, 80.0, 160.0],
     })
-    base = dict(config.GOALS_PARAMS if kind == "goals" else config.CORNERS_PARAMS)
+    base = dict(DEFAULT_PARAMS[kind])
     keys = list(grid)
     rows = []
     for combo in itertools.product(*(grid[k] for k in keys)):

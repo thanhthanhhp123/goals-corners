@@ -9,19 +9,28 @@ For each fixture you get:
 - the full probability distribution of total goals and total corners, with over/under
   probabilities and fair odds for any line (goals 0.5–5.5, corners 6.5–13.5)
 - 1X2, both-teams-to-score, clean sheets and the most likely scorelines
+- the first half: expected goals, half-time result and first-half over/unders
+- total cards (yellow and red), with over/unders 2.5–7.5
 - team corner lines and the chance each side wins more corners
 - recent form (goals and corners, last 6 matches) for both clubs
 - when bookmaker odds are out (league games, a few days before kick-off): the bookmakers'
   probabilities next to ours, average and best prices, and the expected return at each price
-- a price checker: type any bookmaker's odds for a goals, corners or both-teams-to-score line
-  and see our probability and the expected return
+- a price checker: type any bookmaker's odds for goals, corners, cards, 1X2, half-time,
+  both-teams-to-score or Asian handicap (quarter lines included) and see our probability and
+  the expected return
+- Asian handicap at the bookmakers' line next to their prices, with refunds and quarter lines
+  settled as bookmakers settle them
 
 Other views:
 
-- **Lên thuyền** ("get on the boat") suggests picks: the model's strongest over/under calls
-  for the coming days, with our chance, the competition's usual rate, break-even odds and the
-  best bookmaker price where we have one. Picks can be added to a boat (a combo) to see the
-  chance that they all win. Below the list, the same rule's record over past matches.
+- **Lên thuyền** ("get on the boat") suggests picks: the model's strongest calls for the
+  coming days on goals over/under, 1X2, handicap ±1.5, both teams to score, the half-time
+  result, first-half goals, corners and cards, with our chance, the competition's usual rate,
+  break-even odds and the best bookmaker price where we have one (1X2 and over/under 2.5;
+  handicap picks show the bookmakers' Asian handicap line instead).
+  Picks can be added to a boat (a combo) to see the chance that they all win; picks settled by
+  the same match's score are combined on its score grid instead of being multiplied as if
+  independent. Below the list, the same rule's record over past matches, per market.
 - **Results** shows every finished match this season next to the prediction made *before*
   kick-off, with running hit rates.
 - **Match tool** predicts any pairing of clubs, including clubs from different leagues.
@@ -33,7 +42,7 @@ Other views:
 
 ```bash
 pip install -r requirements.txt
-python -m predictor update     # download data, fit, backtest, write web/data/*.json (~3 min the first time)
+python -m predictor update     # download data, fit, backtest, write web/data/*.json (~20 min the first time)
 python -m predictor serve      # http://127.0.0.1:8000
 ```
 
@@ -42,7 +51,7 @@ and opens the browser.
 
 `serve` refreshes the data automatically when it is more than 6 hours old
 (`--refresh-hours 0` turns that off), and the page has a **Refresh data** button.
-A refresh takes about 40 seconds because finished backtest weeks are cached.
+A refresh takes a minute or two because finished backtest weeks are cached.
 If you edit `predictor/config.py`, restart `serve` so it picks up the change.
 
 The `web/` folder is a static site, so once `web/data/` is built any static host can serve it.
@@ -76,10 +85,13 @@ onward. The six target competitions are covered, and so are:
 The extra leagues and cups link every Champions League club to one shared rating scale.
 Raw responses are cached in `data/raw/`; past years are downloaded once.
 ESPN reports a missing box score as 0–0 corners, so those games are treated as missing.
+Each match's timeline gives the minute of every goal and card, which supplies half-time scores
+and card counts (yellow and red, one each) for every competition, the Champions League included.
+A competition-season whose timeline has no cards in most matches (Cyprus) has no card data.
 
 **Odds** (`predictor/market.py`). [football-data.co.uk](https://www.football-data.co.uk)
 publishes free CSVs for 16 of these leagues (not the UEFA cups) with average, best and
-single-bookmaker prices for 1X2 and over/under 2.5, in two snapshots: pre-closing (Tuesday
+single-bookmaker prices for 1X2, over/under 2.5 and the Asian handicap, in two snapshots: pre-closing (Tuesday
 and Friday before a round) and closing. Rows are matched to ESPN events by date, score and
 club names (about 20,000 matches, 99–100% coverage). From each match's 1X2 and over/under
 prices, with the margin removed, we solve for the two expected-goal numbers whose
@@ -109,6 +121,13 @@ log E[count for a side] = mu + competition + home advantage + attack(team) − d
 - Corners: a negative-binomial distribution with a fitted dispersion, because corner totals
   vary more than a Poisson count does. Nudging corners by the odds and adding shot-volume
   ratings were both tested; neither improved the held-out season reliably, so neither is used.
+- First half: the full-time expected goals times the share of goals scored before half-time
+  over the past year (about 45% for home sides, 44% for away sides), as an independent
+  Poisson score grid.
+- Cards: the same rating regression as corners (how often a club is booked, how often its
+  opponents are), with a negative-binomial total. Card rates have fallen since 2023 (big-five
+  matches averaged about 4.6 cards in 2023-24, about 4.0 now), so after the fit the overall
+  level is reset to what the last 60 days produced. The referee is not in the data.
 - Hyperparameters live in `predictor/config.py` and were chosen by `tune` on the 2025-26
   season only.
 
@@ -119,13 +138,14 @@ only the pre-closing odds, which were public a day or more before kick-off. 2026
 held out from tuning. Results are cached in `data/backtest_*.pkl`, so later builds only
 compute new weeks.
 
-**Picks** (`predictor/tips.py`). For each match and market (total goals at 1.5/2.5/3.5,
-total corners at 8.5–11.5) the pick is the side whose chance is furthest above the
-competition's own rate at that line over the past year, if the chance is between 60% and 85%
-and at least 8 points above that rate. Taking the most likely side instead would keep
-listing calls such as "under 11.5 corners" that hold in most matches. The thresholds were set
-for a manageable number of picks (about 20–25 a week), not tuned for results. The same rule
-runs over the backtest to give the record on the page.
+**Picks** (`predictor/tips.py`). The markets are total goals (1.5/2.5/3.5), 1X2, both teams
+to score, handicap ±1.5 (half-goal lines, so no pushes), half-time result, first-half goals
+(0.5/1.5), total corners (8.5–11.5) and total cards (2.5–6.5). For each match and market the pick
+is the outcome whose chance is furthest above how often it happens in the competition over the
+past year, if the chance is between 60% and 85% and at least 8 points above that rate. Taking
+the most likely outcome instead would keep listing calls such as "under 11.5 corners" that hold
+in most matches. The thresholds were set for a manageable number of picks, not tuned for
+results. The same rule runs over the backtest to give the record on the page.
 
 ## Layout
 
@@ -177,16 +197,33 @@ the best price across bookmakers returned −5.5% over 113 bets in 2025-26 and �
 so far in 2026-27. The site shows edges, but treat them as hints. Corner odds are not in the
 free data, so the corner forecasts are only tested against results.
 
-**Picks.** The Lên thuyền picks win about as often as they say. Of 1,090 picks in 2025-26
-(stated 70% on average) 68% won; of 191 in 2026-27 to 20 Oct (stated 70%) 72% won. That makes them
-likely, not profitable: the 233 over/under 2.5 picks of 2025-26 that had odds returned −10%
-at the average price (±4%) and −8% at the best price, because the bookmakers usually rate
-the same side as likely and price it short. 2026-27 to 20 Oct: +1.5% over 46 picks (±9%), which
+**Picks.** Across the eight markets the Lên thuyền picks win about as often as they say. Of
+2,398 picks in 2025-26 (stated 71% on average) 70% won; of 570 in 2026-27 to 24 Oct (stated 71%)
+74% won. That is about 58 picks a week. By market (won, with the stated chance in brackets):
+
+| | 2025-26 | 2026-27 (to 24 Oct) |
+|---|---|---|
+| Goals over/under | 69% of 558 (70%) | 72% of 104 (69%) |
+| 1X2 | 74% of 440 (69%) | 75% of 103 (69%) |
+| Handicap ±1.5 | 70% of 120 (77%) | 74% of 43 (76%) |
+| Both teams score | 61% of 152 (65%) | 74% of 35 (66%) |
+| Half-time result | 69% of 48 (65%) | 75% of 20 (65%) |
+| First-half goals | 74% of 154 (76%) | 80% of 60 (77%) |
+| Corners | 68% of 398 (68%) | 70% of 69 (69%) |
+| Cards | 72% of 528 (74%) | 74% of 136 (73%) |
+
+Handicap and both-teams-to-score picks were overconfident in 2025-26 (by 7 and 4 points) and
+1X2 picks underconfident (by 5). Likely is not the same as profitable: the 240 over/under 2.5
+picks of 2025-26 that had odds returned −10% at the average price (±4%), and the 383 1X2 picks
++1% (±3%), because the bookmakers usually rate the same outcome as likely and price it short.
+2026-27 to 24 Oct: −1% over 47 over/under picks (±9%) and +0.4% over 77 1X2 picks (±7%), which
 is within noise.
 
 ## Limits
 
-Predictions cover regulation time (90 minutes plus stoppage time). Line-ups, injuries,
+Predictions cover regulation time (90 minutes plus stoppage time). Bookmakers settle card
+markets in different ways (some count a red card as 2, or use booking points); ours counts each
+yellow and red card once. Line-ups, injuries,
 suspensions and motivation reach the forecast only through bookmaker odds, so only for league
 games whose odds are out. The Champions League has no odds in the free data. Corner totals are
 noisy by nature. Treat the numbers as an informed starting point, not a certainty.

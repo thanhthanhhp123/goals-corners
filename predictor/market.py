@@ -55,6 +55,8 @@ MARKET_COLUMNS = [
     "mkp_p_home", "mkp_p_draw", "mkp_p_away", "mkp_p_over",  # pre-closing no-vig probabilities
     "odds_over", "odds_under", "best_over", "best_under",    # pre-closing average and best O/U 2.5 prices
     "odds_home", "odds_draw", "odds_away",                   # pre-closing average 1X2 prices
+    "best_home", "best_draw", "best_away",                   # pre-closing best 1X2 prices
+    "ah_line", "odds_ah_home", "odds_ah_away", "best_ah_home", "best_ah_away",  # pre-closing Asian handicap (home line)
     "mk_margin_ou", "fd_home_corners", "fd_away_corners",
 ]
 
@@ -300,6 +302,8 @@ def market_table(matches: pd.DataFrame, teams: pd.DataFrame, rho: float = -0.03,
     lam_best = implied_goals(no_vig(x12_best), no_vig(ou_best)[:, 0], rho)
     lam_pre = implied_goals(p_x12_pre, p_ou_pre, rho)
     best_ou = _first(market, [["Max>2.5", "Max<2.5"]])
+    best_x12 = _first(market, [["MaxH", "MaxD", "MaxA"]])
+    ah = _first(market, [["AvgAHH", "AvgAHA", "MaxAHH", "MaxAHA"]])
 
     out = pd.DataFrame({
         "event_id": market["event_id"].astype(str),
@@ -310,6 +314,9 @@ def market_table(matches: pd.DataFrame, teams: pd.DataFrame, rho: float = -0.03,
         "odds_over": ou_pre[:, 0], "odds_under": ou_pre[:, 1],
         "best_over": best_ou[:, 0], "best_under": best_ou[:, 1],
         "odds_home": x12_pre[:, 0], "odds_draw": x12_pre[:, 1], "odds_away": x12_pre[:, 2],
+        "best_home": best_x12[:, 0], "best_draw": best_x12[:, 1], "best_away": best_x12[:, 2],
+        "ah_line": pd.to_numeric(market.get("AHh"), errors="coerce"),
+        "odds_ah_home": ah[:, 0], "odds_ah_away": ah[:, 1], "best_ah_home": ah[:, 2], "best_ah_away": ah[:, 3],
         "mk_margin_ou": (1 / ou_pre).sum(axis=1) - 1,
         # football-data also records corners, which fills ESPN's gaps
         "fd_home_corners": pd.to_numeric(market.get("HC"), errors="coerce"),

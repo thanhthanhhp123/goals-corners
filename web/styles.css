@@ -16,6 +16,10 @@
   --goals-track: #cde2fb;
   --corners: #eb6834;
   --corners-track: #fbd9c9;
+  --result: #7c4dcc;
+  --result-track: #e4d9f7;
+  --cards: #c48a00;
+  --cards-track: #f5e4b3;
   --good: #006300;
   --warning: #9a6a00;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.06);
@@ -42,6 +46,10 @@
     --goals-track: #1c3556;
     --corners: #d95926;
     --corners-track: #4a2616;
+    --result: #9a73e6;
+    --result-track: #33264d;
+    --cards: #e0a91b;
+    --cards-track: #4a3a10;
     --good: #0ca30c;
     --warning: #fab219;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
@@ -66,6 +74,10 @@
   --goals-track: #1c3556;
   --corners: #d95926;
   --corners-track: #4a2616;
+  --result: #9a73e6;
+  --result-track: #33264d;
+  --cards: #e0a91b;
+  --cards-track: #4a3a10;
   --good: #0ca30c;
   --warning: #fab219;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
@@ -183,6 +195,10 @@ button, select, input { font: inherit; color: inherit; }
 .meter.goals i { background: var(--goals); }
 .meter.corners { background: var(--corners-track); }
 .meter.corners i { background: var(--corners); }
+.meter.result { background: var(--result-track); }
+.meter.result i { background: var(--result); }
+.meter.cards { background: var(--cards-track); }
+.meter.cards i { background: var(--cards); }
 .conf { width: 22px; height: 22px; display: grid; place-items: center; }
 .conf svg { width: 16px; height: 16px; fill: none; stroke: var(--warning); stroke-width: 2; }
 .comp-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; margin-left: 6px; white-space: nowrap; }
@@ -236,6 +252,8 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 .panel h4 .key { width: 10px; height: 10px; border-radius: 3px; }
 .key.goals { background: var(--goals); }
 .key.corners { background: var(--corners); }
+.key.result { background: var(--result); }
+.key.cards { background: var(--cards); }
 .big { display: flex; align-items: baseline; gap: 18px; margin: 8px 0 4px; flex-wrap: wrap; }
 .big .total { font-size: 34px; font-weight: 650; line-height: 1; }
 .big .split { color: var(--ink-2); font-size: 13px; }
@@ -290,6 +308,8 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 .chart .bar.goals.under .mark { fill: var(--goals-track); }
 .chart .bar.corners.over .mark { fill: var(--corners); }
 .chart .bar.corners.under .mark { fill: var(--corners-track); }
+.chart .bar.cards.over .mark { fill: var(--cards); }
+.chart .bar.cards.under .mark { fill: var(--cards-track); }
 .chart .bar:hover .mark, .chart .bar:focus .mark { filter: brightness(1.12); }
 .chart .bar:focus-visible .hit { stroke: var(--accent); stroke-width: 1.5; }
 .chart .series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }

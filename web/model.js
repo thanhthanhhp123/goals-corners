@@ -86,10 +86,11 @@ function pGreater(a, b) {
   return s;
 }
 
-/** Attack/defence strengths of a team for one model ("goals" or "corners"). */
+/** Attack/defence strengths of a team for one model ("goals", "corners" or "cards"). */
 export function teamStrength(model, teams, kind, id) {
   const t = teams[id];
-  if (t && t.r) return kind === 'goals' ? [t.r[0], t.r[1]] : [t.r[2], t.r[3]];
+  const i = { goals: 0, corners: 2, cards: 4 }[kind];
+  if (t && t.r && t.r[i] != null) return [t.r[i], t.r[i + 1]];
   const km = model[kind];
   const g = (t && t.league) || 'other';
   return [km.g_att[g] ?? 0, km.g_dfn[g] ?? 0];
@@ -116,6 +117,35 @@ export function withMarket(model, lh, la, ch, ca, market) {
   ];
 }
 
+/** First-half score grid (mirrors half_matrix in model.py). */
+export function halfMatrix(lh, la, ht, gmax) {
+  return scoreMatrix(lh * ht[0], la * ht[1], 0, gmax);
+}
+
+/**
+ * Asian handicap on a score grid: [share of the stake won, share lost] for a bet on `side`
+ * ("home" or "away") at the home side's `line`. A quarter line (-0.75) splits the stake over
+ * the two lines either side (-0.5 and -1); whatever is neither won nor lost is refunded.
+ */
+export function ahSettle(m, line, side) {
+  const halves = Math.abs(Math.round(line * 4)) % 2 === 1 ? [line - 0.25, line + 0.25] : [line, line];
+  let won = 0, lost = 0;
+  m.forEach((row, i) => row.forEach((p, j) => {
+    for (const x of halves) {
+      const v = side === 'home' ? i - j + x : j - i - x;
+      if (v > 0) won += p / 2; else if (v < 0) lost += p / 2;
+    }
+  }));
+  return [won, lost];
+}
+
+/** [P(home ahead), P(level), P(away ahead)] from a score grid. */
+function hda(m) {
+  const out = [0, 0, 0];
+  m.forEach((row, i) => row.forEach((p, j) => { out[i > j ? 0 : i === j ? 1 : 2] += p; }));
+  return out;
+}
+
 /** Full prediction in the same shape as fixtures.json entries. */
 export function predictMatch(model, teams, home, away, comp, neutral = false, market = null) {
   const [lh0, la0] = rates(model, teams, 'goals', home, away, comp, neutral);
@@ -126,12 +156,14 @@ export function predictMatch(model, teams, home, away, comp, neutral = false, ma
   const cornersTotal = countPmf(ch + ca, model.corners.dispersion, model.max_corners);
   const homeC = countPmf(ch, model.corners.side_dispersion, model.max_corners);
   const awayC = countPmf(ca, model.corners.side_dispersion, model.max_corners);
+  const m1 = halfMatrix(lh, la, model.ht, model.max_goals);
+  const [kh, ka] = rates(model, teams, 'cards', home, away, comp, neutral);
+  const cardsTotal = countPmf(kh + ka, model.cards.dispersion, model.max_cards);
 
   const cells = [];
-  let hw = 0, dr = 0, aw = 0, btts = 0, homeCs = 0, awayCs = 0;
+  let btts = 0, homeCs = 0, awayCs = 0;
   m.forEach((row, i) => row.forEach((p, j) => {
     cells.push({ h: i, a: j, p });
-    if (i > j) hw += p; else if (i === j) dr += p; else aw += p;
     if (i > 0 && j > 0) btts += p;
     if (j === 0) homeCs += p;
     if (i === 0) awayCs += p;
@@ -145,7 +177,7 @@ export function predictMatch(model, teams, home, away, comp, neutral = false, ma
       home: lh, away: la, total: lh + la,
       pmf: trim(goalsTotal, 9),
       over: overK(goalsTotal, model.goal_lines),
-      btts, hda: [hw, dr, aw], cs: [homeCs, awayCs],
+      btts, hda: hda(m), cs: [homeCs, awayCs],
       scores: cells.slice(0, 8),
     },
     corners: {
@@ -156,6 +188,12 @@ export function predictMatch(model, teams, home, away, comp, neutral = false, ma
       away_over: overK(awayC, model.team_corner_lines),
       home_more: pGreater(homeC, awayC),
       away_more: pGreater(awayC, homeC),
+    },
+    ht: { home: lh * model.ht[0], away: la * model.ht[1], hda: hda(m1), over: overK(totalFromMatrix(m1), model.ht_lines) },
+    cards: {
+      home: kh, away: ka, total: kh + ka,
+      pmf: trim(cardsTotal, 12),
+      over: overK(cardsTotal, model.card_lines),
     },
   };
 }

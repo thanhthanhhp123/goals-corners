@@ -3,9 +3,10 @@ import json
 import shutil
 import subprocess
 
+import numpy as np
 import pytest
 
-from predictor import config
+from predictor import config, dist
 
 SCRIPT = r"""
 import { readFileSync } from 'node:fs';
@@ -37,7 +38,7 @@ def test_js_matches_python(tmp_path):
     for row in json.loads(res.stdout):
         py = fixtures[row["id"]]
         js = row["pred"]
-        for kind in ("goals", "corners"):
+        for kind in ("goals", "corners", "cards"):
             # ratings are exported rounded to 4 d.p., so allow small drift
             assert js[kind]["total"] == pytest.approx(py[kind]["total"], abs=5e-3)
             for line, p in py[kind]["over"].items():
@@ -47,3 +48,32 @@ def test_js_matches_python(tmp_path):
         assert js["goals"]["btts"] == pytest.approx(py["goals"]["btts"], abs=3e-3)
         assert js["goals"]["cs"][0] == pytest.approx(py["goals"]["cs"][0], abs=3e-3)
         assert js["corners"]["home_more"] == pytest.approx(py["corners"]["home_more"], abs=3e-3)
+        for a, b in zip(js["goals"]["hda"] + js["ht"]["hda"], py["goals"]["hda"] + py["ht"]["hda"]):
+            assert a == pytest.approx(b, abs=3e-3)
+        for line, p in py["ht"]["over"].items():
+            assert js["ht"]["over"][line] == pytest.approx(p, abs=3e-3)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_js_asian_handicap_settlement(tmp_path):
+    m = dist.score_matrix(1.7, 1.0, -0.03, 10)
+    script = tmp_path / "ah.mjs"
+    script.write_text(
+        "import { pathToFileURL } from 'node:url';\n"
+        "const { ahSettle } = await import(pathToFileURL(process.argv[2] + '/model.js'));\n"
+        f"const m = {json.dumps(m.tolist())};\n"
+        "console.log(JSON.stringify([-0.75, -0.5, 0, 0.25, 1].flatMap((l) => ['home', 'away'].map((s) => ahSettle(m, l, s)))));\n",
+        encoding="utf-8")
+    js = json.loads(subprocess.run(["node", str(script), str(config.WEB_DIR)], capture_output=True, text=True, check=True).stdout)
+    d = np.subtract.outer(np.arange(11), np.arange(11))  # home margin
+    win = lambda line, s: (m[(d if s == "home" else -d) + (line if s == "home" else -line) > 0]).sum()  # noqa: E731
+    lose = lambda line, s: (m[(d if s == "home" else -d) + (line if s == "home" else -line) < 0]).sum()  # noqa: E731
+    i = 0
+    for line in (-0.75, -0.5, 0, 0.25, 1):
+        halves = (line - 0.25, line + 0.25) if line * 4 % 2 else (line, line)
+        for side in ("home", "away"):
+            want = [sum(win(x, side) for x in halves) / 2, sum(lose(x, side) for x in halves) / 2]
+            assert js[i] == pytest.approx(want, abs=1e-9), (line, side)
+            i += 1
+    # home -0.75: winning by one returns half the stake, so it is neither all won nor all lost
+    assert js[0][0] + js[0][1] < 1

@@ -63,6 +63,10 @@ class RateModel:
     # Goals only: weight of a match whose target is the market's expected goals
     # instead of the scoreline (0 = ignore the market).
     market_weight: float = 0.0
+    # When positive, the baseline is rescaled after the fit so that matches from the last
+    # `level_days` days average what they produced: the overall level then follows a drift
+    # (cards have been falling) faster than the half-life lets the club ratings move.
+    level_days: float = 0.0
 
     # fitted state
     mu: float = 0.0
@@ -204,6 +208,10 @@ class RateModel:
         self.side_dispersion = _fit_nb_size(np.concatenate([yh, ya]), np.concatenate([rh, ra_]), np.concatenate([w, w]))
         self.dispersion = _fit_nb_size(yh + ya, rh + ra_, w)
         self._train = (yh, ya, rh, ra_, w)
+        if self.level_days > 0:
+            recent = np.tile((df["date"] >= as_of - pd.Timedelta(days=self.level_days)).to_numpy(), 2)
+            if recent.any():
+                self.mu += float(np.log(np.concatenate([yh, ya])[recent].sum() / rates[recent].sum()))
         return self
 
     def fit_rho(self) -> "RateModel":
@@ -275,12 +283,31 @@ def _fit_nb_size(y: np.ndarray, mean: np.ndarray, w: np.ndarray) -> float:
     return float(np.exp(res.x))
 
 
+def fit_half(played: pd.DataFrame, as_of: pd.Timestamp, days: float = 365.0) -> tuple[float, float]:
+    """Share of home and of away goals scored before half-time, over the year before `as_of`.
+
+    First-half goals are then Poisson with the full-time expected goals times these
+    shares: the split barely varies between clubs, so one pair serves every match."""
+    df = played[(played["date"] < as_of) & (played["date"] >= as_of - pd.Timedelta(days=days))]
+    df = df.dropna(subset=["home_ht_goals", "away_ht_goals"])
+    if df.empty:
+        return 0.45, 0.45
+    return float(df["home_ht_goals"].sum() / df["home_goals"].sum()), float(df["away_ht_goals"].sum() / df["away_goals"].sum())
+
+
+def half_matrix(lh: float, la: float, ht: tuple[float, float]) -> np.ndarray:
+    """First-half score grid. web/model.js mirrors this function."""
+    return dist.score_matrix(lh * ht[0], la * ht[1], 0.0, config.MAX_GOALS)
+
+
 @dataclass
 class MatchPredictor:
-    """Joins the goals and corners models into full match predictions."""
+    """Joins the goals, corners and cards models into full match predictions."""
 
     goals: RateModel
     corners: RateModel
+    cards: RateModel
+    ht: tuple[float, float]  # share of each side's goals scored before half-time
 
     def predict(self, home: str, away: str, comp: str, neutral: bool = False,
                 market: tuple[float, float] | None = None) -> dict:
@@ -295,8 +322,12 @@ class MatchPredictor:
         away_c = _count_pmf(ca, self.corners.side_dispersion, config.MAX_CORNERS)
         flat = np.argsort(m, axis=None)[::-1][:8]
         scores = [{"h": int(i // m.shape[1]), "a": int(i % m.shape[1]), "p": float(m.flat[i])} for i in flat]
+        m1 = half_matrix(lh, la, self.ht)
+        kh, ka = self.cards.rates(home, away, comp, neutral)
+        cards_total = _count_pmf(kh + ka, self.cards.dispersion, config.MAX_CARDS)
         return {
             "goals": {
+                "matrix": m,
                 "home": lh,
                 "away": la,
                 "total": lh + la,
@@ -320,6 +351,22 @@ class MatchPredictor:
                 "away_over": {str(l): dist.p_over(away_c, l) for l in config.TEAM_CORNER_LINES},
                 "home_more": float(_p_greater(home_c, away_c)),
                 "away_more": float(_p_greater(away_c, home_c)),
+                "total_pmf": corners_total,
+            },
+            "ht": {
+                "matrix": m1,
+                "home": lh * self.ht[0],
+                "away": la * self.ht[1],
+                "hda": [float(np.tril(m1, -1).sum()), float(np.trace(m1)), float(np.triu(m1, 1).sum())],
+                "over": {str(l): dist.p_over(dist.total_from_matrix(m1), l) for l in config.HT_LINES},
+            },
+            "cards": {
+                "home": kh,
+                "away": ka,
+                "total": kh + ka,
+                "pmf": _trim(cards_total, 12),
+                "over": {str(l): dist.p_over(cards_total, l) for l in config.CARD_LINES},
+                "total_pmf": cards_total,
             },
         }
 
@@ -372,4 +419,6 @@ def fit_predictor(matches: pd.DataFrame, as_of: pd.Timestamp, goals_params: dict
               market=("mk_home", "mk_away")).fit_rho()
     corners = RateModel.from_params(corners_params or config.CORNERS_PARAMS)
     corners.fit(played, "home_corners", "away_corners", as_of, groups, warm=warm.corners if warm else None)
-    return MatchPredictor(goals, corners)
+    cards = RateModel.from_params(config.CARDS_PARAMS)
+    cards.fit(played, "home_cards", "away_cards", as_of, groups, warm=warm.cards if warm else None)
+    return MatchPredictor(goals, corners, cards, fit_half(played, as_of))

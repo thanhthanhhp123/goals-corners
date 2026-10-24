@@ -31,8 +31,8 @@ def _r(x, nd=3):
 
 
 def _params_key() -> str:
-    blob = json.dumps({"g": config.GOALS_PARAMS, "c": config.CORNERS_PARAMS, "b": config.MARKET_BLEND,
-                       "cm": config.CORNER_MARKET, "rho": config.MARKET_RHO, "v": 3}, sort_keys=True)
+    blob = json.dumps({"g": config.GOALS_PARAMS, "c": config.CORNERS_PARAMS, "k": config.CARDS_PARAMS, "b": config.MARKET_BLEND,
+                       "cm": config.CORNER_MARKET, "rho": config.MARKET_RHO, "v": 5}, sort_keys=True)
     return hashlib.md5(blob.encode()).hexdigest()[:10]
 
 
@@ -42,18 +42,18 @@ def cached_backtest(matches: pd.DataFrame, now: pd.Timestamp) -> pd.DataFrame:
     cache_path = config.DATA_DIR / f"backtest_{_params_key()}.pkl"
     cache = pd.read_pickle(cache_path) if cache_path.exists() else pd.DataFrame()
     done = set(cache["origin"]) if not cache.empty else set()
+    start = pd.Timestamp(BACKTEST_START, tz="UTC")
+    is_complete = lambda t0: t0 + pd.Timedelta(days=7) < now - pd.Timedelta(days=2)  # noqa: E731
+    todo = [t0 for t0 in pd.date_range(start, now, freq="7D") if not (is_complete(t0) and t0 in done)]
     complete, partial = [], []
-    for t0 in pd.date_range(pd.Timestamp(BACKTEST_START, tz="UTC"), now, freq="7D"):
-        t1 = t0 + pd.Timedelta(days=7)
-        is_complete = t1 < now - pd.Timedelta(days=2)
-        if is_complete and t0 in done:
-            continue
-        preds = backtest.rolling(matches, t0, min(t1, now), step_days=7)
-        if preds.empty:
-            continue
-        preds["origin"] = t0
-        # Windows still in progress are used for this build but never cached.
-        (complete if is_complete else partial).append(preds)
+    if todo:
+        # one pass from the first missing week, so each week's fit starts from the last one's
+        preds = backtest.rolling(matches, todo[0], now, step_days=7)
+        if not preds.empty:
+            preds["origin"] = start + (preds["date"] - start) // pd.Timedelta(days=7) * pd.Timedelta(days=7)
+            for t0, week in preds[preds["origin"].isin(todo)].groupby("origin"):
+                # Windows still in progress are used for this build but never cached.
+                (complete if is_complete(t0) else partial).append(week)
     if complete:
         cache = pd.concat([f for f in [cache, *complete] if not f.empty], ignore_index=True)
         cache.to_pickle(cache_path)
@@ -179,7 +179,7 @@ def recent_averages(played: pd.DataFrame, n: int = 10) -> dict[str, dict]:
 
 
 def _prediction_json(pred: dict) -> dict:
-    g, c = pred["goals"], pred["corners"]
+    g, c, ht, k = pred["goals"], pred["corners"], pred["ht"], pred["cards"]
     return {
         "goals": {
             "home": _r(g["home"]), "away": _r(g["away"]), "total": _r(g["total"]),
@@ -195,6 +195,10 @@ def _prediction_json(pred: dict) -> dict:
             "away_over": {k: _r(v, 4) for k, v in c["away_over"].items()},
             "home_more": _r(c["home_more"], 4), "away_more": _r(c["away_more"], 4),
         },
+        "ht": {"home": _r(ht["home"]), "away": _r(ht["away"]), "hda": [_r(p, 4) for p in ht["hda"]],
+               "over": {k_: _r(v, 4) for k_, v in ht["over"].items()}},
+        "cards": {"home": _r(k["home"]), "away": _r(k["away"]), "total": _r(k["total"]),
+                  "pmf": [_r(p, 4) for p in k["pmf"]], "over": {k_: _r(v, 4) for k_, v in k["over"].items()}},
     }
 
 
@@ -210,7 +214,10 @@ def _market_json(predictor: MatchPredictor, row, mk) -> dict | None:
         "hda": [_r(row.mkp_p_home, 4), _r(row.mkp_p_draw, 4), _r(row.mkp_p_away, 4)],
         "odds": {"over": price(row.odds_over), "under": price(row.odds_under),
                  "best_over": price(row.best_over), "best_under": price(row.best_under),
-                 "home": price(row.odds_home), "draw": price(row.odds_draw), "away": price(row.odds_away)},
+                 "home": price(row.odds_home), "draw": price(row.odds_draw), "away": price(row.odds_away),
+                 "best_home": price(row.best_home), "best_draw": price(row.best_draw), "best_away": price(row.best_away),
+                 "ah_line": price(row.ah_line), "ah_home": price(row.odds_ah_home), "ah_away": price(row.odds_ah_away),
+                 "best_ah_home": price(row.best_ah_home), "best_ah_away": price(row.best_ah_away)},
         "margin": _r(row.mk_margin_ou, 4),
         "model": {"total": _r(alone["goals"]["total"]), "p_over": _r(alone["goals"]["over"]["2.5"], 4),
                   "corners": _r(alone["corners"]["total"])},
@@ -218,7 +225,9 @@ def _market_json(predictor: MatchPredictor, row, mk) -> dict | None:
 
 
 def _tip_json(t: dict) -> dict:
-    out = {"kind": t["kind"], "line": t["line"], "side": t["side"], "p": _r(t["p"], 4), "base": _r(t["base"], 4)}
+    # a DataFrame turns the missing line of 1X2 and BTTS picks into NaN
+    line = None if t["line"] is None or pd.isna(t["line"]) else float(t["line"])
+    out = {"kind": t["kind"], "line": line, "side": t["side"], "p": _r(t["p"], 4), "base": _r(t["base"], 4)}
     if "won" in t:
         out["won"] = bool(t["won"])
         if pd.notna(t.get("price")):
@@ -257,7 +266,8 @@ def build(force_fetch: bool = True) -> dict:
     predictor = fit_predictor(matches, now)
 
     log.info("predicting fixtures")
-    bases = tips.base_rates(played, config.TARGET_COMPETITIONS, now)
+    history = played[played["date"] >= now - pd.Timedelta(days=365)]
+    bases = {comp: tips.base_rates(history, comp) for comp in config.TARGET_COMPETITIONS}
     upcoming = matches[
         matches["comp"].isin(config.TARGET_COMPETITIONS)
         & matches["state"].isin(["pre", "in"])
@@ -270,7 +280,9 @@ def build(force_fetch: bool = True) -> dict:
             continue
         mk = (row.mkp_home, row.mkp_away)
         mk = mk if np.all(np.isfinite(mk)) else None
-        pred = _prediction_json(predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral), market=mk))
+        raw = predictor.predict(row.home_id, row.away_id, row.comp, bool(row.neutral), market=mk)
+        pred = _prediction_json(raw)
+        p = tips.probs(raw["goals"]["matrix"], raw["ht"]["matrix"], raw["corners"]["total_pmf"], raw["cards"]["total_pmf"])
         fixtures.append({
             "id": row.event_id, "comp": row.comp, "date": row.date.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "state": row.state, "status": row.status, "neutral": bool(row.neutral), "venue": row.venue,
@@ -278,7 +290,7 @@ def build(force_fetch: bool = True) -> dict:
             "confidence": _confidence(predictor, row.home_id, row.away_id),
             "market": _market_json(predictor, row, mk),
             **pred,
-            "tips": [_tip_json(t) for t in tips.fixture_tips(pred, bases[row.comp])],
+            "tips": [_tip_json(t) for t in tips.picks(p, bases[row.comp])],
         })
 
     log.info("backtesting")
@@ -294,7 +306,9 @@ def build(force_fetch: bool = True) -> dict:
     for r in recent.to_dict("records"):
         rec = {"id": r["event_id"], "comp": r["comp"], "date": r["date"].strftime("%Y-%m-%dT%H:%M:%SZ"), "home": r["home_id"], "away": r["away_id"],
                "neutral": bool(r["neutral"])}
-        for kind in ("goals", "corners"):
+        if pd.notna(r.get("home_ht_goals")) and pd.notna(r.get("away_ht_goals")):
+            rec["ht"] = [int(r["home_ht_goals"]), int(r["away_ht_goals"])]
+        for kind in ("goals", "corners", "cards"):
             actual = r.get(f"{kind}_actual")
             if actual is None or pd.isna(actual):
                 continue
@@ -341,8 +355,9 @@ def build(force_fetch: bool = True) -> dict:
         if tid in selectable or tid in {f["home"] for f in fixtures} | {f["away"] for f in fixtures}:
             ga_att, ga_dfn = predictor.goals.team_strength(tid)
             co_att, co_dfn = predictor.corners.team_strength(tid)
+            ca_att, ca_dfn = predictor.cards.team_strength(tid)
             entry.update({
-                "r": [_r(ga_att, 4), _r(ga_dfn, 4), _r(co_att, 4), _r(co_dfn, 4)],
+                "r": [_r(ga_att, 4), _r(ga_dfn, 4), _r(co_att, 4), _r(co_dfn, 4), _r(ca_att, 4), _r(ca_dfn, 4)],
                 "profile": {"gf": _r(gf, 2), "ga": _r(ga, 2), "cf": _r(cf, 2), "ca": _r(ca, 2)},
                 "n_eff": _r(min(predictor.goals.n_eff.get(tid, 0.0), predictor.corners.n_eff.get(tid, 0.0)), 1),
                 "recent": averages.get(tid),
@@ -355,9 +370,12 @@ def build(force_fetch: bool = True) -> dict:
     model_json = {
         "goals": {k: _round_tree(v, 5) for k, v in predictor.goals.export().items()},
         "corners": {k: _round_tree(v, 5) for k, v in predictor.corners.export().items()},
+        "cards": {k: _round_tree(v, 5) for k, v in predictor.cards.export().items()},
+        "ht": [_r(x, 5) for x in predictor.ht],
         "market_blend": config.MARKET_BLEND, "corner_market": config.CORNER_MARKET,
-        "max_goals": config.MAX_GOALS, "max_corners": config.MAX_CORNERS,
+        "max_goals": config.MAX_GOALS, "max_corners": config.MAX_CORNERS, "max_cards": config.MAX_CARDS,
         "goal_lines": config.GOAL_LINES, "corner_lines": config.CORNER_LINES, "team_corner_lines": config.TEAM_CORNER_LINES,
+        "ht_lines": config.HT_LINES, "card_lines": config.CARD_LINES,
     }
     meta = {
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -367,7 +385,8 @@ def build(force_fetch: bool = True) -> dict:
         "fixtures": len(fixtures), "competitions": competitions,
         "matches_with_odds": int(played["mk_home"].notna().sum()),
         "fixtures_with_odds": sum(1 for f in fixtures if f["market"]),
-        "params": {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS,
+        "matches_with_cards": int(played["home_cards"].notna().sum()),
+        "params": {"goals": config.GOALS_PARAMS, "corners": config.CORNERS_PARAMS, "cards": config.CARDS_PARAMS,
                    "market_blend": config.MARKET_BLEND, "corner_market": config.CORNER_MARKET},
         "metrics": metrics,
     }

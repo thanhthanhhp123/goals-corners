@@ -21,7 +21,8 @@ HEADERS = {"User-Agent": "corner-goal-predictor/1.0"}
 
 
 def _cache_path(slug: str, year: int) -> Path:
-    return config.RAW_DIR / slug / f"{year}.json"
+    # v2 adds goal and card events; files without them are downloaded again
+    return config.RAW_DIR / slug / f"{year}.v2.json"
 
 
 def _get_json(url: str, params: dict, attempts: int = 4) -> dict:
@@ -55,6 +56,19 @@ def _fetch_events(slug: str, period: str) -> list[dict]:
 KEEP_STATS = {"wonCorners", "totalShots", "shotsOnTarget", "possessionPct"}
 
 
+def _slim_detail(d: dict) -> list | None:
+    """A goal or card event as [kind ("g", "y" or "r"), team id, minute]; minute 45 covers
+    first-half stoppage time ("45'+2'"). Shoot-out kicks and other events give None."""
+    kind = "g" if d.get("scoringPlay") and not d.get("shootout") else "r" if d.get("redCard") else "y" if d.get("yellowCard") else None
+    if kind is None:
+        return None
+    try:
+        minute = int(str((d.get("clock") or {}).get("displayValue", "")).split("'")[0])
+    except ValueError:
+        minute = None
+    return [kind, str((d.get("team") or {}).get("id", "")), minute]
+
+
 def _slim_event(event: dict) -> dict:
     """Keep only the fields `normalise` reads; raw scoreboards are ~20x larger."""
     comps = []
@@ -80,6 +94,7 @@ def _slim_event(event: dict) -> dict:
                 "venue": {"fullName": (comp.get("venue") or {}).get("fullName")},
                 "status": {"type": ((comp.get("status") or {}).get("type") or {})},
                 "odds": [{"overUnder": (o or {}).get("overUnder")} for o in comp.get("odds", []) or []],
+                "details": [x for x in map(_slim_detail, comp.get("details") or []) if x],
                 "competitors": competitors,
             }
         )
@@ -158,6 +173,28 @@ def _goals_line(competition: dict) -> float | None:
     return None
 
 
+def _events(competition: dict, home_id: str, away_id: str, home_goals, away_goals) -> dict:
+    """Half-time goals and cards (yellow + red, one each) per side from the event list.
+
+    No events at all means ESPN has no timeline for the match: cards are then unknown,
+    and half-time goals too unless the match ended 0-0. Half-time goals are also left
+    unknown when the goal events do not add up to the score."""
+    det = competition.get("details") or []
+    out = {"home_ht_goals": np.nan, "away_ht_goals": np.nan, "home_cards": np.nan, "away_cards": np.nan}
+    if not det:
+        if home_goals == 0 and away_goals == 0:
+            out["home_ht_goals"] = out["away_ht_goals"] = 0
+        return out
+    count = lambda kinds, team, half=False: sum(  # noqa: E731
+        1 for k, t, m in det if k in kinds and t == team and (not half or (m is not None and m <= 45)))
+    if count("g", home_id) == home_goals and count("g", away_id) == away_goals:
+        goals_timed = all(m is not None for k, _, m in det if k == "g")
+        if goals_timed:
+            out["home_ht_goals"], out["away_ht_goals"] = count("g", home_id, True), count("g", away_id, True)
+    out["home_cards"], out["away_cards"] = count("yr", home_id), count("yr", away_id)
+    return out
+
+
 def normalise(by_slug: dict[str, list[dict]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Turn raw ESPN events into a `matches` frame and a `teams` frame."""
     rows = []
@@ -185,6 +222,7 @@ def normalise(by_slug: dict[str, list[dict]]) -> tuple[pd.DataFrame, pd.DataFram
                         "logo": team.get("logo") or "",
                         "color": team.get("color") or "",
                     }
+            home_id, away_id = str(home.get("team", {}).get("id", "")), str(away.get("team", {}).get("id", ""))
             rows.append(
                 {
                     "event_id": str(event.get("id")),
@@ -197,10 +235,11 @@ def normalise(by_slug: dict[str, list[dict]]) -> tuple[pd.DataFrame, pd.DataFram
                     "completed": bool(status.get("completed")),
                     "neutral": bool(comp.get("neutralSite")),
                     "venue": (comp.get("venue") or {}).get("fullName") or "",
-                    "home_id": str(home.get("team", {}).get("id", "")),
-                    "away_id": str(away.get("team", {}).get("id", "")),
+                    "home_id": home_id,
+                    "away_id": away_id,
                     "home_goals": _score(home),
                     "away_goals": _score(away),
+                    **_events(comp, home_id, away_id, _score(home), _score(away)),
                     "home_corners": _stat(home, "wonCorners"),
                     "away_corners": _stat(away, "wonCorners"),
                     "home_shots": _stat(home, "totalShots"),
@@ -221,6 +260,11 @@ def normalise(by_slug: dict[str, list[dict]]) -> tuple[pd.DataFrame, pd.DataFram
     for a, b in (("home_corners", "away_corners"), ("home_shots", "away_shots")):
         missing = (matches[a] == 0) & (matches[b] == 0)
         matches.loc[missing, [a, b]] = np.nan
+    # Some feeds time the goals but never log cards (Cyprus). About 2% of real matches have
+    # no card, so a competition-season where most matches have none has no card data.
+    booked = ((matches["home_cards"] + matches["away_cards"]) > 0).astype(float).where(matches["home_cards"].notna())
+    no_cards = booked.groupby([matches["comp"], matches["season"]]).transform("mean") < 0.5
+    matches.loc[no_cards, ["home_cards", "away_cards"]] = np.nan
     return matches, pd.DataFrame(list(teams.values()))
 
 

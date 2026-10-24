@@ -1,4 +1,4 @@
-import { predictMatch } from './model.js';
+import { predictMatch, scoreMatrix, halfMatrix, ahSettle } from './model.js';
 import { distributionChart, calibrationChart, hideTip } from './charts.js';
 
 const TARGETS = ['eng.1', 'esp.1', 'ita.1', 'ger.1', 'fra.1', 'uefa.champions'];
@@ -26,6 +26,7 @@ const state = {
   search: '',
   goalLine: store.get('goalLine', '2.5'),
   cornerLine: store.get('cornerLine', '9.5'),
+  cardLine: store.get('cardLine', '4.5'),
   sort: store.get('sort', 'date'),
   teamSort: { key: 'gf', dir: -1 },
   season: null,
@@ -192,7 +193,7 @@ function renderFilters() {
     box.append(
       select('Show', state.tipsRange, [['1', 'Next 24 hours'], ['3', 'Next 3 days'], ['7', 'Next 7 days'], ['14', 'Next 14 days']],
         (v) => { state.tipsRange = v; store.set('tipsRange', v); renderView(); }),
-      select('Market', state.tipsMarket, [['all', 'Goals and corners'], ['goals', 'Goals'], ['corners', 'Corners']],
+      select('Market', state.tipsMarket, [['all', 'All markets'], ...Object.entries(MARKETS).map(([k, m]) => [k, m.name])],
         (v) => { state.tipsMarket = v; store.set('tipsMarket', v); renderView(); }),
       select('Sort', state.tipsSort, [['date', 'Kick-off'], ['p', 'Most likely'], ['lift', 'Furthest above league rate']],
         (v) => { state.tipsSort = v; store.set('tipsSort', v); renderView(); }),
@@ -358,7 +359,51 @@ function openResult(r) {
 }
 
 // ------------------------------------------------------------------ lên thuyền (picks)
-const pickLabel = (t) => `${t.side === 'over' ? 'Over' : 'Under'} ${t.line} ${t.kind}`;
+// Pick markets (predictor/tips.py MARKETS): what settles each one and its colour family.
+const MARKETS = {
+  goals: { name: 'Goals over/under', src: 'ft', fam: 'goals' },
+  result: { name: '1X2', src: 'ft', fam: 'result' },
+  handicap: { name: 'Handicap', src: 'ft', fam: 'result' },
+  btts: { name: 'Both teams score', src: 'ft', fam: 'goals' },
+  ht_result: { name: '1X2, first half', src: 'ht', fam: 'result' },
+  ht_goals: { name: 'Goals, first half', src: 'ht', fam: 'goals' },
+  corners: { name: 'Corners', src: 'corners', fam: 'corners' },
+  cards: { name: 'Cards', src: 'cards', fam: 'cards' },
+};
+const fam = (t) => MARKETS[t.kind]?.fam ?? t.kind;
+const shortName = (id) => team(id).short || team(id).name;
+
+function pickLabel(t, m) {
+  const side = shortName(t.side === 'home' ? m.home : m.away);
+  const ou = (unit) => `${t.side === 'over' ? 'Over' : 'Under'} ${t.line} ${unit}`;
+  switch (t.kind) {
+    case 'result': return t.side === 'draw' ? 'Draw' : `${side} win`;
+    case 'ht_result': return t.side === 'draw' ? 'Level at half-time' : `${side} ahead at half-time`;
+    case 'btts': return t.side === 'yes' ? 'Both teams score' : 'Not both teams score';
+    case 'handicap': return `${side} ${t.line > 0 ? '+' : '−'}${Math.abs(t.line)} handicap`;
+    case 'ht_goals': return ou('goals, first half');
+    default: return ou(t.kind);
+  }
+}
+
+function pickSub(t, f) {
+  const src = MARKETS[t.kind].src;
+  if (src === 'ht') return `Expected half-time ${f1(f.ht.home)}–${f1(f.ht.away)}`;
+  if (t.kind === 'goals') return `Expected ${f1(f.goals.total)} goals`;
+  if (src === 'ft') return `Expected score ${f1(f.goals.home)}–${f1(f.goals.away)}`;
+  return `Expected ${f1(f[t.kind].total)} ${t.kind}`;
+}
+
+/** Whether a selection wins given the home and away counts (mirrors hit in predictor/tips.py). */
+function hit(side, line, h, a) {
+  if (side === 'over') return h + a > line;
+  if (side === 'under') return h + a < line;
+  if (side === 'yes') return h > 0 && a > 0;
+  if (side === 'no') return h === 0 || a === 0;
+  if (side === 'draw') return h === a;
+  return (side === 'home' ? h - a : a - h) + (line ?? -0.5) > 0;
+}
+
 const matchName = (m) => `${team(m.home).name} v ${team(m.away).name}`;
 const wantKind = (t) => state.tipsMarket === 'all' || t.kind === state.tipsMarket;
 let boatOpen = false;
@@ -369,12 +414,14 @@ function allPicks() {
   return out;
 }
 
-/** Bookmaker prices for a pick, when our data has them (over/under 2.5 goals in league games). */
+/** Bookmaker prices for a pick, when our data has them (1X2 and over/under 2.5 goals in league games). */
 function pickPrices(f, t) {
-  if (t.kind !== 'goals' || t.line !== 2.5 || !f.market) return null;
-  const o = f.market.odds;
-  return t.side === 'over' ? { avg: o.over, best: o.best_over } : { avg: o.under, best: o.best_under };
+  const o = f.market?.odds;
+  const k = t.kind === 'result' || (t.kind === 'goals' && t.line === 2.5) ? t.side : null;
+  return o && k ? { avg: o[k], best: o[`best_${k}`] } : null;
 }
+
+const signedLine = (l) => (l > 0 ? `+${l}` : l < 0 ? `−${Math.abs(l)}` : '0');
 
 function setBoat(keys) {
   state.boat = keys;
@@ -384,7 +431,7 @@ function setBoat(keys) {
 
 function boatToggle(key, t, f) {
   return h('button', {
-    class: 'boat-toggle', type: 'button', 'data-key': key, 'data-label': `${pickLabel(t)}, ${matchName(f)}`,
+    class: 'boat-toggle', type: 'button', 'data-key': key, 'data-label': `${pickLabel(t, f)}, ${matchName(f)}`,
     onclick: () => setBoat(state.boat.includes(key) ? state.boat.filter((k) => k !== key) : [...state.boat, key]),
   });
 }
@@ -404,11 +451,11 @@ function tipRow({ f, t, key }, showDate) {
     h('div', { class: 'team' }, logo(f.home), h('span', {}, team(f.home).name)),
     h('div', { class: 'team' }, logo(f.away), h('span', {}, team(f.away).name))),
     h('div', { class: 'pick' },
-      h('div', { class: 'pick-label' }, h('span', { class: `key ${t.kind}` }), pickLabel(t)),
-      h('div', { class: 'pick-sub' }, `Expected ${f1(f[t.kind].total)} ${t.kind}`)),
+      h('div', { class: 'pick-label' }, h('span', { class: `key ${fam(t)}` }), pickLabel(t, f)),
+      h('div', { class: 'pick-sub' }, `${MARKETS[t.kind].name} · ${pickSub(t, f)}`)),
     h('div', { class: 'chance' },
       h('div', { class: 'top' }, h('b', {}, pct(t.p)), h('span', { class: 'muted' }, `league ${pct(t.base)}`)),
-      h('div', { class: `meter ${t.kind}`, role: 'img', 'aria-label': `${pct(t.p)} chance; ${pct(t.base)} in a typical ${compShort(f.comp)} match` },
+      h('div', { class: `meter ${fam(t)}`, role: 'img', 'aria-label': `${pct(t.p)} chance; ${pct(t.base)} in a typical ${compShort(f.comp)} match` },
         h('i', { style: `width:${Math.round(t.p * 100)}%` }), h('b', { class: 'base', style: `left:${(t.base * 100).toFixed(1)}%` }))),
     h('div', { class: 'price' },
       h('span', {}, 'Break-even odds ', h('b', {}, odds(t.p))),
@@ -418,10 +465,38 @@ function tipRow({ f, t, key }, showDate) {
 }
 
 function noPriceReason(f, t) {
-  if (t.kind === 'corners') return 'No corner prices in our data';
   if (f.comp.startsWith('uefa.')) return 'No Champions League prices in our data';
-  if (t.line !== 2.5) return 'Our data prices the 2.5 line only';
-  return 'No bookmaker price yet';
+  if (t.kind === 'result' || (t.kind === 'goals' && t.line === 2.5)) return 'No bookmaker price yet';
+  if (t.kind === 'handicap' && f.market?.odds.ah_line != null) return `Bookmakers' line: ${shortName(f.home)} ${signedLine(f.market.odds.ah_line)}`;
+  return 'Our data prices 1X2 and over/under 2.5 goals only';
+}
+
+/**
+ * Chance that every leg wins. Legs settled by the same match's full-time score (or its
+ * half-time score) are combined on that score grid, so "home win" and "over 2.5" in one
+ * match are not treated as independent. Everything else is multiplied.
+ */
+function boatChance(legs) {
+  let p = 1;
+  const grids = new Map();
+  for (const x of legs) {
+    const src = MARKETS[x.t.kind].src;
+    if (src !== 'ft' && src !== 'ht') { p *= x.t.p; continue; }
+    const k = `${x.f.id}:${src}`;
+    if (!grids.has(k)) grids.set(k, []);
+    grids.get(k).push(x);
+  }
+  for (const xs of grids.values()) {
+    if (xs.length === 1) { p *= xs[0].t.p; continue; }
+    const g = xs[0].f.goals;
+    const m = MARKETS[xs[0].t.kind].src === 'ht'
+      ? halfMatrix(g.home, g.away, D.model.ht, D.model.max_goals)
+      : scoreMatrix(g.home, g.away, D.model.goals.rho, D.model.max_goals);
+    let s = 0;
+    m.forEach((row, i) => row.forEach((q, j) => { if (xs.every((x) => hit(x.t.side, x.t.line, i, j))) s += q; }));
+    p *= s;
+  }
+  return p;
 }
 
 function renderBoat() {
@@ -439,14 +514,19 @@ function renderBoat() {
   box.hidden = !legs.length;
   if (!legs.length) { box.replaceChildren(); return; }
 
-  const p = legs.reduce((s, x) => s * x.t.p, 1);
+  const p = boatChance(legs);
+  const naive = legs.reduce((s, x) => s * x.t.p, 1);
   const price = h('input', { type: 'number', inputmode: 'decimal', min: '1.01', step: '0.01', placeholder: 'e.g. 3.20', 'aria-label': 'Decimal odds for the whole boat' });
   const out = h('span', { role: 'status' });
   price.addEventListener('input', () => {
     const o = Number(price.value);
     out.replaceChildren(o > 1 ? h('span', {}, 'expected return ', h('b', { class: p * o - 1 > VALUE_EDGE ? 'edge-pos' : '' }, signedPct(p * o - 1))) : '');
   });
-  const sameMatch = new Set(legs.map((x) => x.f.id)).size < legs.length;
+  // sources settling legs of each match: one score grid links its legs, anything more is approximate
+  const sources = new Map();
+  for (const x of legs) sources.set(x.f.id, new Set([...(sources.get(x.f.id) ?? []), MARKETS[x.t.kind].src]));
+  const linked = Math.abs(p - naive) > 1e-9;
+  const approx = [...sources.values()].some((s) => s.size > 1);
   box.replaceChildren(h('div', {},
     h('div', { class: 'boat-bar' },
       h('span', { class: 'boat-title' }, icon('boat'), h('b', {}, 'Your boat'), ` · ${legs.length} ${legs.length === 1 ? 'pick' : 'picks'}`),
@@ -458,37 +538,46 @@ function renderBoat() {
         h('button', { class: 'btn ghost', type: 'button', onclick: () => setBoat([]) }, 'Clear'))),
     boatOpen ? h('div', { class: 'boat-body' },
       h('ul', { class: 'boat-legs' }, legs.map((x) => h('li', {},
-        h('span', {}, h('span', { class: `key ${x.t.kind}` }), h('b', {}, pickLabel(x.t)),
+        h('span', {}, h('span', { class: `key ${fam(x.t)}` }), h('b', {}, pickLabel(x.t, x.f)),
           h('span', { class: 'muted' }, ` · ${matchName(x.f)} · ${shortDate(new Date(x.f.date))} ${timeStr(new Date(x.f.date))}`)),
         h('span', { class: 'leg-p' }, pct(x.t.p),
           h('button', {
-            class: 'btn ghost icon close', type: 'button', 'aria-label': `Remove ${pickLabel(x.t)}, ${matchName(x.f)}`,
+            class: 'btn ghost icon close', type: 'button', 'aria-label': `Remove ${pickLabel(x.t, x.f)}, ${matchName(x.f)}`,
             onclick: () => setBoat(state.boat.filter((k) => k !== x.key)),
           }, icon('cross')))))),
       h('div', { class: 'checker' }, h('label', { class: 'field' }, 'Your bookmaker\'s price for the whole boat', price), out),
       h('p', { class: 'small muted' },
-        'The chance that all picks win multiplies their chances. ',
-        sameMatch ? 'Goals and corners picks from the same match are related, so for those the combined chance is only approximate. ' : '',
+        'Picks from different matches are independent, so their chances multiply. ',
+        linked ? `Picks settled by the same match's score are worked out together on its score forecast (multiplying them would give ${pct(naive)}). ` : '',
+        approx ? 'Picks from one match on different things (goals and corners, or the full-time and half-time score) are treated as independent, so for those the combined chance is only approximate. ' : '',
         'The bookmaker\'s margin is charged on every leg, so a combo usually pays well under the break-even odds.')) : null));
 }
 
 function tipsRecord(view) {
   const seasons = D.meta.metrics.filter((s) => s.tips);
   if (!seasons.length) return;
-  const rate = (x) => (x ? `${pct(x.hit)} of ${x.n.toLocaleString()}` : '–');
-  const roi = (o, k) => (o ? `${signedPct(o[k].roi)} (±${Math.round((o[k].roi_se ?? 0) * 100)}%)` : '–');
+  const roi = (o) => (o ? `${signedPct(o.roi)} (±${Math.round((o.roi_se ?? 0) * 100)}%)` : '–');
   view.append(h('div', { class: 'section-title' }, 'How past picks did'),
     h('div', { class: 'card table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, ['Season', 'Picks', 'Won', 'We said', 'Goals picks', 'Corners picks', 'With odds', 'Return, avg price', 'Return, best price']
+      h('thead', {}, h('tr', {}, ['Season', 'Picks', 'Won', 'We said', 'Per week', 'With odds', 'Return, avg price', 'Return, best price']
         .map((t, i) => h('th', { class: i === 0 ? 'left' : '' }, t)))),
       h('tbody', {}, seasons.map((s) => {
         const x = s.tips;
         return h('tr', {},
           h('td', { class: 'left' }, s.label, h('span', { class: 'comp-tag' }, s.note)),
           h('td', {}, x.n.toLocaleString()), h('td', {}, `${x.won.toLocaleString()} (${pct(x.hit)})`), h('td', {}, pct(x.p)),
-          h('td', {}, rate(x.by_kind.goals)), h('td', {}, rate(x.by_kind.corners)),
-          h('td', {}, x.odds ? x.odds.n : 0), h('td', {}, roi(x.odds, 'avg_price')), h('td', {}, roi(x.odds, 'best_price')));
+          h('td', {}, f1(x.per_week)),
+          h('td', {}, x.odds ? x.odds.n : 0), h('td', {}, roi(x.odds?.avg_price)), h('td', {}, roi(x.odds?.best_price)));
       })))));
+
+  const kinds = Object.keys(MARKETS).filter((k) => seasons.some((s) => s.tips.by_kind[k]));
+  const cell = (x, o) => (x ? h('td', {}, `${pct(x.hit)} of ${x.n.toLocaleString()}`, h('span', { class: 'muted' }, ` · said ${pct(x.p)}`),
+    o ? h('div', { class: 'small muted' }, `return ${signedPct(o.roi)} over ${o.n}`) : null) : h('td', { class: 'muted' }, '–'));
+  view.append(h('div', { class: 'card table-wrap', style: 'margin-top:12px' }, h('table', { class: 'mini-table' },
+    h('thead', {}, h('tr', {}, h('th', { class: 'left' }, 'Market'), seasons.map((s) => h('th', {}, `Won, ${s.label}`)))),
+    h('tbody', {}, kinds.map((k) => h('tr', {},
+      h('td', { class: 'left' }, h('span', { class: `key ${MARKETS[k].fam}` }), ' ', MARKETS[k].name),
+      seasons.map((s) => cell(s.tips.by_kind[k], s.tips.odds?.by_kind?.[k]))))))));
 
   const tiers = seasons[0].tips.tiers.map((t) => [t.lo, t.hi]);
   view.append(h('div', { class: 'card table-wrap', style: 'margin-top:12px;max-width:640px' }, h('table', { class: 'mini-table' },
@@ -502,7 +591,17 @@ function tipsRecord(view) {
   view.append(h('p', { class: 'small muted' },
     'Past picks come from the weekly backtest: each week the model was refitted on earlier matches only and the same rule was applied to its forecasts. ',
     'When "Happened" is close to "We said", the chances are honest. "Return" is what one-unit bets on every pick returned at the bookmakers\' pre-closing prices; ',
-    'only over/under 2.5 goals picks have prices in our data. A likely pick is not the same as a good bet: the bookmakers usually see the same thing and price it short.'));
+    'only 1X2 and over/under 2.5 goals picks have prices in our data. A likely pick is not the same as a good bet: the bookmakers usually see the same thing and price it short.'));
+}
+
+const countText = (n, unit) => `${n} ${n === 1 ? unit : `${unit}s`}`;
+
+function outcomeText(r, t) {
+  const src = MARKETS[t.kind]?.src;
+  if (src === 'ht') return r.ht ? `${r.ht[0]}–${r.ht[1]} at half-time` : '–';
+  if (t.kind === 'goals') return countText(r.goals.actual, 'goal');
+  if (src === 'ft') return `${r.goals.home_actual}–${r.goals.away_actual}`;
+  return r[t.kind] ? countText(r[t.kind].actual, t.kind.slice(0, -1)) : '–';
 }
 
 function recentPicks(view) {
@@ -510,7 +609,7 @@ function recentPicks(view) {
   const rows = [];
   for (const r of D.results) {
     if (!r.tips || !matchesFilter(r) || Date.parse(r.date) < from) continue;
-    for (const t of r.tips) if (wantKind(t) && r[t.kind]) rows.push({ r, t });
+    for (const t of r.tips) if (wantKind(t) && MARKETS[t.kind]) rows.push({ r, t });
   }
   if (!rows.length) return;
   rows.sort((a, b) => b.r.date.localeCompare(a.r.date));
@@ -523,22 +622,23 @@ function recentPicks(view) {
       h('tbody', {}, rows.slice(0, 150).map(({ r, t }) => h('tr', { class: 'clickable', onclick: () => openResult(r) },
         h('td', { class: 'left muted' }, shortDate(new Date(r.date)), h('span', { class: 'comp-tag' }, compShort(r.comp))),
         h('td', { class: 'left' }, matchName(r), r.goals ? h('span', { class: 'muted' }, ` ${r.goals.home_actual}–${r.goals.away_actual}`) : null),
-        h('td', { class: 'left' }, h('span', { class: `key ${t.kind}` }), pickLabel(t)),
+        h('td', { class: 'left' }, h('span', { class: `key ${fam(t)}` }), pickLabel(t, r)),
         h('td', {}, pct(t.p)),
-        h('td', {}, h('span', { class: `verdict ${t.won ? 'ok' : 'miss'}` }, icon(t.won ? 'check' : 'cross'), `${r[t.kind].actual} ${r[t.kind].actual === 1 ? t.kind.slice(0, -1) : t.kind}`))))))));
+        h('td', {}, h('span', { class: `verdict ${t.won ? 'ok' : 'miss'}` }, icon(t.won ? 'check' : 'cross'), outcomeText(r, t)))))))));
 }
 
 function renderTips(view) {
   const horizon = Date.now() + Number(state.tipsRange) * 864e5;
-  const picks = allPicks().filter(({ f, t }) => f.state === 'pre' && wantKind(t) && matchesFilter(f) && Date.parse(f.date) <= horizon);
+  const picks = allPicks().filter(({ f, t }) => f.state === 'pre' && MARKETS[t.kind] && wantKind(t) && matchesFilter(f) && Date.parse(f.date) <= horizon);
   const key = { p: (x) => -x.t.p, lift: (x) => x.t.base - x.t.p }[state.tipsSort];
   picks.sort(key ? (a, b) => key(a) - key(b) : (a, b) => a.f.date.localeCompare(b.f.date));
 
   const seasons = D.meta.metrics.filter((s) => s.tips);
   const rule = seasons.at(-1)?.tips.rule ?? { min_prob: 0.6, min_lift: 0.08 };
   view.append(h('p', { class: 'intro' },
-    'The model\'s strongest over/under calls for the coming days. A match gets a pick when our chance for one side of a line is at least ',
-    pct(rule.min_prob), ` and at least ${Math.round(rule.min_lift * 100)} points above how often that side lands in the competition (last 12 months). `,
+    'The model\'s strongest calls for the coming days: goals and first-half goals, 1X2 (full time and first half), handicap, both teams to score, corners and cards. ',
+    'A match gets a pick in a market when our chance for one outcome is at least ',
+    pct(rule.min_prob), ` and at least ${Math.round(rule.min_lift * 100)} points above how often that outcome happens in the competition (last 12 months). `,
     'Tap + to put picks in your boat and see the chance that they all win.'));
 
   const sum = (fn) => seasons.reduce((s, x) => s + fn(x.tips), 0);
@@ -549,11 +649,11 @@ function renderTips(view) {
     n ? tile(`Past picks won, since ${seasons[0].label}`, pct(sum((x) => x.won) / n),
       `${sum((x) => x.won).toLocaleString()} of ${n.toLocaleString()} · we said ${pct(sum((x) => x.p * x.n) / n)}`) : null,
     nOdds ? tile('Return at bookmaker prices', signedPct(sum((x) => (x.odds ? x.odds.avg_price.roi * x.odds.n : 0)) / nOdds),
-      `${nOdds} past over/under 2.5 picks, average price`) : null));
+      `${nOdds.toLocaleString()} past 1X2 and over/under 2.5 picks, average price`) : null));
 
   if (!picks.length) {
     view.append(h('div', { class: 'card empty' }, D.fixtures.some((f) => f.tips?.length)
-      ? 'No picks match these filters. Try a longer time window.' : 'No picks for the coming fixtures yet.'));
+      ? 'No picks match these filters. Try a longer time window or another market.' : 'No picks for the coming fixtures yet.'));
   } else {
     const head = h('div', { class: 'tip-head', 'aria-hidden': 'true' },
       h('div', {}), h('div', {}, 'Time'), h('div', {}, 'Match'), h('div', {}, 'Pick'), h('div', {}, 'Chance'), h('div', {}, 'Price'));
@@ -600,9 +700,11 @@ function pOverFromPmf(pmf, line) {
   return s;
 }
 
+const LINE_STATE = { goals: 'goalLine', corners: 'cornerLine', cards: 'cardLine' };
+
 function distPanel(kind, f, lines, initial) {
   const x = f[kind];
-  const unit = kind === 'goals' ? 'goals' : 'corners';
+  const unit = kind;
   const body = h('div');
   const draw = (line) => {
     // over-probabilities come from the full distribution; the chart's last bucket is "n or more"
@@ -617,17 +719,40 @@ function distPanel(kind, f, lines, initial) {
       distributionChart(x.pmf, { line: Number(line), series: kind, unit, ariaLabel: `Probability of each total ${unit} count` }));
   };
   draw(initial);
-  const label = kind === 'goals' ? 'Total goals' : 'Total corners';
+  const label = `Total ${kind}`;
   return h('div', { class: 'card panel' },
     h('h4', {}, h('span', { class: `key ${kind}` }), label),
     h('div', { class: 'big' },
       h('span', { class: 'total' }, f2(x.total)),
       h('span', { class: 'split' }, team(f.home).short || team(f.home).name, ' ', h('b', {}, f2(x.home)), ' · ', team(f.away).short || team(f.away).name, ' ', h('b', {}, f2(x.away)))),
     linePicker(lines, initial, (l) => {
-      if (kind === 'goals') { state.goalLine = l; store.set('goalLine', l); } else { state.cornerLine = l; store.set('cornerLine', l); }
+      state[LINE_STATE[kind]] = l;
+      store.set(LINE_STATE[kind], l);
       draw(l);
     }),
     body);
+}
+
+function halfPanel(f) {
+  const x = f.ht;
+  const hn = shortName(f.home), an = shortName(f.away);
+  return h('div', { class: 'card panel' },
+    h('h4', {}, h('span', { class: 'key result' }), 'First half'),
+    h('div', { class: 'big' },
+      h('span', { class: 'total' }, f2(x.home + x.away)),
+      h('span', { class: 'split' }, hn, ' ', h('b', {}, f2(x.home)), ' · ', an, ' ', h('b', {}, f2(x.away)))),
+    h('div', { class: 'facts' },
+      fact(`${hn} ahead`, pct(x.hda[0])), fact('Level', pct(x.hda[1])), fact(`${an} ahead`, pct(x.hda[2])),
+      D.model.ht_lines.map((l) => fact(`Over ${l} goals`, pct(x.over[String(l)])))),
+    h('p', { class: 'small muted' },
+      `First-half goals are the full-time expected goals times the share scored before the break (${pct(D.model.ht[0])} of home goals, ${pct(D.model.ht[1])} of away goals over the past year).`));
+}
+
+function cardsExtras(f) {
+  const x = f.cards;
+  return h('p', { class: 'small muted' },
+    `${shortName(f.home)} ${f2(x.home)} · ${shortName(f.away)} ${f2(x.away)} expected. `,
+    'Yellow and red cards, one each. The referee is not in our data, and bookmakers count cards in different ways (some score a red as 2), so check how yours settles.');
 }
 
 function goalsExtras(f) {
@@ -647,9 +772,10 @@ function goalsExtras(f) {
 const signedPct = (x) => (x == null ? '–' : `${x >= 0 ? '+' : '−'}${Math.abs(x * 100).toFixed(1)}%`);
 const VALUE_EDGE = 0.03;
 
-function edgeCell(prob, price) {
+/** `stake` is the share of the stake that is settled (below 1 when a handicap can refund). */
+function edgeCell(prob, price, stake = 1) {
   if (!price) return h('td', { class: 'muted' }, '–');
-  const ev = prob * price - 1;
+  const ev = stake * (prob * price - 1);
   return h('td', { class: ev > VALUE_EDGE ? 'edge-pos' : 'muted' }, signedPct(ev));
 }
 
@@ -665,9 +791,18 @@ function marketPanel(f) {
   const hn = team(f.home).short || team(f.home).name;
   const an = team(f.away).short || team(f.away).name;
   const p = g.over['2.5'];
-  const row = (label, ours, theirs, avg, best) => h('tr', {},
+  const row = (label, ours, theirs, avg, best, stake = 1) => h('tr', {},
     h('td', { class: 'left' }, label), h('td', {}, h('b', {}, pct(ours))), h('td', {}, pct(theirs)),
-    h('td', {}, avg ? f2(avg) : '–'), h('td', {}, best ? f2(best) : '–'), h('td', { class: 'muted' }, odds(ours)), edgeCell(ours, best));
+    h('td', {}, avg ? f2(avg) : '–'), h('td', {}, best ? f2(best) : '–'), h('td', { class: 'muted' }, odds(ours)), edgeCell(ours, best, stake));
+  // Asian handicap at the bookmakers' line: chances leave refunds out, the edge counts them
+  const ah = m.odds.ah_line != null && m.odds.ah_home && m.odds.ah_away ? (() => {
+    const grid = scoreMatrix(g.home, g.away, D.model.goals.rho, D.model.max_goals);
+    const book = (1 / m.odds.ah_home) / (1 / m.odds.ah_home + 1 / m.odds.ah_away);
+    return [['home', hn, m.odds.ah_line, book], ['away', an, -m.odds.ah_line, 1 - book]].map(([side, name, line, theirs]) => {
+      const [w, l] = ahSettle(grid, m.odds.ah_line, side);
+      return row(`${name} ${signedLine(line)}`, w / (w + l), theirs, m.odds[`ah_${side}`], m.odds[`best_ah_${side}`], w + l);
+    });
+  })() : [];
   const rec = valueRecord();
   return h('div', { class: 'card panel' },
     h('h4', {}, 'Against the bookmakers'),
@@ -677,11 +812,13 @@ function marketPanel(f) {
       h('tbody', {},
         row('Over 2.5', p, m.p_over, m.odds.over, m.odds.best_over),
         row('Under 2.5', 1 - p, 1 - m.p_over, m.odds.under, m.odds.best_under),
-        row(`${hn} win`, g.hda[0], m.hda[0], m.odds.home, null),
-        row('Draw', g.hda[1], m.hda[1], m.odds.draw, null),
-        row(`${an} win`, g.hda[2], m.hda[2], m.odds.away, null)))),
+        row(`${hn} win`, g.hda[0], m.hda[0], m.odds.home, m.odds.best_home),
+        row('Draw', g.hda[1], m.hda[1], m.odds.draw, m.odds.best_draw),
+        row(`${an} win`, g.hda[2], m.hda[2], m.odds.away, m.odds.best_away),
+        ah))),
     h('p', { class: 'small muted' },
       `"Bookmakers" is the average price with the margin (${pct(m.margin)} on this over/under) removed. `,
+      ah.length ? 'The handicap rows use the bookmakers\' Asian handicap line; their chances leave out refunded stakes (quarter lines split the stake over the two lines either side). ' : '',
       `On its own the model expected ${f2(m.model.total)} goals (${pct(m.model.p_over)} over 2.5); the bookmakers imply ${f2(m.xg[0] + m.xg[1])}. `,
       `The forecast on this page takes ${Math.round(D.model.market_blend * 100)}% from the bookmakers, the mix that scored best on the 2025-26 tuning season.`),
     rec ? h('p', { class: 'small muted' },
@@ -689,17 +826,31 @@ function marketPanel(f) {
       h('b', {}, signedPct(rec.best_price.roi)), ` over ${rec.best_price.bets} bets (±${Math.round((rec.best_price.roi_se ?? 0) * 100)}% standard error).`) : null);
 }
 
+const AH_LINES = Array.from({ length: 25 }, (_, i) => (i - 12) / 4);  // -3 to +3 in quarters
+
 function priceChecker(f) {
+  let g0 = null;
+  const grid = () => (g0 ??= scoreMatrix(f.goals.home, f.goals.away, D.model.goals.rho, D.model.max_goals));
   const hn = team(f.home).short || team(f.home).name;
   const an = team(f.away).short || team(f.away).name;
   const over = (x, l) => x.over[l] ?? pOverFromPmf(x.pmf, l);
+  const ou = (p) => [['Over', p], ['Under', (l) => 1 - p(l)]];
+  const hda = (x, suffix) => [[`${hn} ${suffix}`, () => x[0]], [suffix === 'win' ? 'Draw' : 'Level', () => x[1]], [`${an} ${suffix}`, () => x[2]]];
   const markets = [
-    { label: 'Total goals', lines: D.model.goal_lines, def: state.goalLine, p: (l) => over(f.goals, l) },
-    { label: 'Total corners', lines: D.model.corner_lines, def: state.cornerLine, p: (l) => over(f.corners, l) },
-    { label: `${hn} corners`, lines: D.model.team_corner_lines, def: '4.5', p: (l) => f.corners.home_over[l] },
-    { label: `${an} corners`, lines: D.model.team_corner_lines, def: '4.5', p: (l) => f.corners.away_over[l] },
-    { label: 'Both teams score', lines: null, p: () => f.goals.btts },
-  ];
+    { label: 'Total goals', lines: D.model.goal_lines, def: state.goalLine, sides: ou((l) => over(f.goals, l)) },
+    { label: 'Match result (1X2)', sides: hda(f.goals.hda, 'win') },
+    { label: 'Both teams score', sides: [['Yes', () => f.goals.btts], ['No', () => 1 - f.goals.btts]] },
+    { label: 'Total corners', lines: D.model.corner_lines, def: state.cornerLine, sides: ou((l) => over(f.corners, l)) },
+    { label: `${hn} corners`, lines: D.model.team_corner_lines, def: '4.5', sides: ou((l) => f.corners.home_over[l]) },
+    { label: `${an} corners`, lines: D.model.team_corner_lines, def: '4.5', sides: ou((l) => f.corners.away_over[l]) },
+    f.ht ? { label: 'Half-time result', sides: hda(f.ht.hda, 'ahead') } : null,
+    f.ht ? { label: 'First-half goals', lines: D.model.ht_lines, def: '0.5', sides: ou((l) => f.ht.over[l]) } : null,
+    f.cards ? { label: 'Total cards', lines: D.model.card_lines, def: state.cardLine, sides: ou((l) => over(f.cards, l)) } : null,
+    {
+      label: 'Asian handicap', lines: AH_LINES, def: String(f.market?.odds.ah_line ?? -0.5), lineLabel: (l) => `${hn} ${signedLine(Number(l))}`,
+      sides: ['home', 'away'].map((s) => [s === 'home' ? hn : an, (l) => ahSettle(grid(), Number(l), s)]),
+    },
+  ].filter(Boolean);
   const mSel = h('select', { 'aria-label': 'Market' }, markets.map((m, i) => h('option', { value: i }, m.label)));
   const lSel = h('select', { 'aria-label': 'Line' });
   const sSel = h('select', { 'aria-label': 'Side' });
@@ -708,22 +859,25 @@ function priceChecker(f) {
   const fillLines = () => {
     const m = markets[mSel.value];
     lSel.hidden = !m.lines;
-    if (m.lines) lSel.replaceChildren(...m.lines.map((l) => h('option', { value: String(l), selected: String(l) === String(m.def) }, String(l))));
-    sSel.replaceChildren(...(m.lines ? ['Over', 'Under'] : ['Yes', 'No']).map((s) => h('option', { value: s }, s)));
+    if (m.lines) lSel.replaceChildren(...m.lines.map((l) => h('option', { value: String(l), selected: String(l) === String(m.def) }, m.lineLabel ? m.lineLabel(l) : String(l))));
+    sSel.replaceChildren(...m.sides.map(([s], i) => h('option', { value: i }, s)));
   };
   const update = () => {
     const m = markets[mSel.value];
-    const q0 = m.p(m.lines ? lSel.value : null);
-    const q = sSel.value === 'Over' || sSel.value === 'Yes' ? q0 : 1 - q0;
+    // a side gives its chance, or [share won, share lost] when stakes can be refunded
+    const r = m.sides[sSel.value][1](m.lines ? lSel.value : null);
+    const [w, l] = Array.isArray(r) ? r : [r, 1 - r];
+    const q = w / (w + l);
+    const refund = 1 - w - l > 0.005 ? ` · stake back ${pct(1 - w - l)}` : '';
     const o = Number(price.value);
     if (!(o > 1)) {
-      out.replaceChildren(h('span', {}, 'Our chance ', h('b', {}, pct(q)), ` · fair odds ${odds(q)}. Enter a bookmaker's price to compare.`));
+      out.replaceChildren(h('span', {}, 'Our chance ', h('b', {}, pct(q)), `${refund} · fair odds ${odds(q)}. Enter a bookmaker's price to compare.`));
       return;
     }
-    const ev = q * o - 1;
+    const ev = w * (o - 1) - l;
     const verdict = ev > 0.05 ? ['edge-pos', 'Above our fair price'] : ev > 0 ? ['', 'Slightly above our fair price, within the model\'s error'] : ['muted', 'Below our fair price'];
     out.replaceChildren(
-      h('span', {}, 'Our chance ', h('b', {}, pct(q)), ` · the price implies ${pct(1 / o)} · expected return `, h('b', { class: verdict[0] }, signedPct(ev))),
+      h('span', {}, 'Our chance ', h('b', {}, pct(q)), `${refund} · the price implies ${pct(1 / o)} · expected return `, h('b', { class: verdict[0] }, signedPct(ev))),
       h('span', { class: `checker-verdict ${verdict[0]}` }, verdict[1]));
   };
   mSel.addEventListener('change', () => { fillLines(); update(); });
@@ -733,7 +887,7 @@ function priceChecker(f) {
   update();
   return h('div', { class: 'card panel' },
     h('h4', {}, 'Check a price'),
-    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Compare any bookmaker\'s decimal odds with our probability.'),
+    h('p', { class: 'small muted', style: 'margin-top:0' }, 'Compare any bookmaker\'s decimal odds with our probability. Handicap chances leave out refunded stakes; the expected return counts them.'),
     h('div', { class: 'checker' }, mSel, lSel, sSel, price),
     out,
     h('p', { class: 'small muted' }, 'Bookmakers often take a bigger margin on corner markets than on goals. Our corner forecasts have been tested against results only: corner odds are not in our data.'));
@@ -800,7 +954,7 @@ export function matchDetail(f, { closable }) {
   }
   if (f.tips?.length && !f.result) {
     notes.push(h('div', { class: 'note' }, h('span', {},
-      h('a', { href: '#tips' }, 'Lên thuyền'), ': ', f.tips.map((t) => `${pickLabel(t)} (${pct(t.p)})`).join(' · '))));
+      h('a', { href: '#tips' }, 'Lên thuyền'), ': ', f.tips.map((t) => `${pickLabel(t, f)} (${pct(t.p)})`).join(' · '))));
   }
   if (f.confidence === 'low' || f.confidence === 'medium') {
     notes.push(h('div', { class: 'note' }, icon('warn'),
@@ -815,6 +969,9 @@ export function matchDetail(f, { closable }) {
     h('div', { class: 'detail-grid' },
       h('div', {}, distPanel('goals', f, D.model.goal_lines, state.goalLine), h('div', { class: 'card panel', style: 'margin-top:16px' }, goalsExtras(f))),
       h('div', {}, distPanel('corners', f, D.model.corner_lines, state.cornerLine), h('div', { class: 'card panel', style: 'margin-top:16px' }, cornersExtras(f)))),
+    f.cards && f.ht ? h('div', { class: 'detail-grid' },
+      h('div', {}, distPanel('cards', f, D.model.card_lines, state.cardLine), h('div', { class: 'card panel', style: 'margin-top:16px' }, cardsExtras(f))),
+      halfPanel(f)) : null,
     f.result ? null : h('div', { class: 'detail-grid' }, f.market ? marketPanel(f) : null, priceChecker(f)),
     h('div', { class: 'section-title', style: 'padding:0 20px' }, 'Recent form'),
     h('div', { class: 'form-grid', style: 'padding-top:0' }, formTable(f.home), formTable(f.away)));
@@ -1031,6 +1188,9 @@ function renderModel(view) {
         ? ', and a side the bookmakers rate above the model also gets slightly more expected corners.' : '.'),
     h('h3', {}, 'Corners'),
     h('p', {}, 'The same structure is fitted separately on corners won: a corner-winning rating and a corner-conceding rating per club. Corner totals vary more than a Poisson count allows, so total corners use a negative-binomial distribution with its spread fitted from the data. ESPN records missing box scores as 0–0 corners; those games are treated as missing, and filled from football-data.co.uk where it has the count.'),
+    h('h3', {}, 'Half-time and cards'),
+    h('p', {}, `ESPN's match timeline gives the minute of every goal and card. First-half goals are the full-time expected goals times the share of goals scored before the break over the past year (${pct(D.model.ht[0])} for home sides, ${pct(D.model.ht[1])} for away sides), which gives a half-time score grid. `,
+      `Cards (yellow and red, one each; ${(m.matches_with_cards ?? 0).toLocaleString()} matches with a timeline) get the same rating model as corners: how often a club is booked, and how often its opponents are. The referee is not in the data.`),
     h('h3', {}, 'Testing'),
     h('p', {}, 'Settings were tuned on 2025-26 only. 2026-27 is held out: each week the model is refitted on matches played before that week and then scored on that week\'s games, using only the pre-closing odds that were public a day or more before kick-off. The baseline is the competition\'s own distribution of totals over the previous year. RPS skill is the improvement in ranked probability score over that baseline; higher is better.'),
     h('p', {}, 'Predictions cover regulation time only. Line-ups, injuries and motivation reach the forecast only through bookmaker odds, when a fixture has them, so use these numbers as a starting point, not a guarantee.'),

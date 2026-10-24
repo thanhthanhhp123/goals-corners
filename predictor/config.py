@@ -83,6 +83,18 @@ CORNERS_PARAMS = {
     "lam_comp": 50.0,
     "lam_home": 20.0,
 }
+# Cards (yellow + red, one each): attack = how often a club is booked, defence = how
+# rarely its opponents are. Card rates have fallen since 2023, so the overall level is
+# reset to the last 60 days. Tuned on 2025-26: half-lives of 45-180 days scored worse than
+# 270, and the level reset improved the log score by 0.001.
+CARDS_PARAMS = {
+    "half_life_days": 270.0,
+    "lam_team": 40.0,
+    "lam_group": 2.0,
+    "lam_comp": 50.0,
+    "lam_home": 20.0,
+    "level_days": 60.0,
+}
 
 # Bookmaker odds (football-data.co.uk). MARKET_RHO is the Dixon-Coles correlation
 # used to turn 1X2 and over/under prices into expected goals. When a match has
@@ -100,5 +112,8 @@ CONFIDENCE_HALF_LIFE = 270.0
 GOAL_LINES = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
 CORNER_LINES = [6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5]
 TEAM_CORNER_LINES = [2.5, 3.5, 4.5, 5.5, 6.5]
+HT_LINES = [0.5, 1.5, 2.5]
+CARD_LINES = [2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
 MAX_GOALS = 10
 MAX_CORNERS = 30
+MAX_CARDS = 20

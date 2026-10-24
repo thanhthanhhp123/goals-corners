@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120  # a full backtest rebuild (after a settings change) takes 30-60 min
     steps:
       - uses: actions/checkout@v4
 
